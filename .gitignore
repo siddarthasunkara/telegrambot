@@ -1,0 +1,8 @@
+*.whl
+*.tar.gz
+*.egg-info/
+__pycache__/
+*.py[cod]
+venv/
+env/
+.env
