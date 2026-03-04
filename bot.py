@@ -290,17 +290,20 @@ def build_welcome_text(shop):
     )
 
 def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
-    """Send welcome.
-    - Persistent buyer reply keyboard shown ONCE (silently, then deleted if remove_reply_kb).
-    - Welcome message carries ONLY the inline buttons (home_kb).
-    - This prevents the double-menu issue where buyer sees keyboard twice in chat.
+    """Send welcome message for buyers.
+    - Attaches the persistent buyer ReplyKeyboard directly to the welcome message.
+    - This avoids the double-menu issue caused by the old send+delete pattern.
+    - Owners must never be passed into this function.
     """
+    # Safety guard: never show buyer keyboard to owners
+    if get_client_by_owner(chat_id):
+        return
+
     text = build_welcome_text(shop)
     lang = get_lang(chat_id)
     buyer_kb = buyer_reply_kb(lang)
 
-    # Always set the persistent bottom keyboard first (silently)
-    # If remove_reply_kb: dismiss old keyboard first, then set new one
+    # If we need to dismiss a stale keyboard first, do so silently
     if remove_reply_kb:
         try:
             msg = bot.send_message(chat_id, ".", reply_markup=ReplyKeyboardRemove())
@@ -308,26 +311,24 @@ def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
         except Exception:
             pass
 
-    # Send the persistent buyer keyboard once — silently (deleted immediately)
-    # This ensures the bottom keyboard is always set even when there's no prior message
-    try:
-        kb_msg = bot.send_message(chat_id, ".", reply_markup=buyer_kb)
-        bot.delete_message(chat_id, kb_msg.message_id)
-    except Exception:
-        pass
-
     photo = shop.get("shop_photo", "")
     if photo:
         try:
-            # Photo with inline buttons only (no reply_markup on photo = cleaner)
+            # Send photo with the persistent buyer keyboard attached
             bot.send_photo(chat_id, photo, caption=text,
-                           parse_mode="Markdown", reply_markup=reply_markup)
+                           parse_mode="Markdown", reply_markup=buyer_kb)
+            # Also send inline home buttons separately (can't mix ReplyKeyboard + InlineKeyboard)
+            if reply_markup:
+                bot.send_message(chat_id, "👇 What would you like to do?",
+                                 reply_markup=reply_markup)
             return
         except Exception as e:
             print(f"Failed to send shop photo: {e}")
 
-    # No photo — welcome text with inline buttons only
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+    # No photo — send welcome with buyer keyboard, then inline buttons
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=buyer_kb)
+    if reply_markup:
+        bot.send_message(chat_id, "👇 Choose an option:", reply_markup=reply_markup)
 
 def parse_slug_from_input(text):
     """
@@ -479,12 +480,14 @@ def start(message):
                 parse_mode="Markdown", reply_markup=owner_reply_kb()
             )
         else:
+            # Pure buyer with no shop link — remove any stale keyboards
             bot.send_message(
                 message.chat.id,
                 "👋 *Welcome to TeleKart!*\n\n"
                 "If you're a *customer* — use your shop's link to get started.\n"
                 "If you're a *shop owner* — type /help",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardRemove()
             )
         return
 
@@ -495,6 +498,20 @@ def start(message):
             "❌ Shop not found.\n\nPlease use a valid shop link.\n\n"
             "_Tip: Ask the shop owner to send you the correct link._",
             parse_mode="Markdown"
+        )
+        return
+
+    # ── OWNER GUARD: if this user is the owner of ANY shop, redirect to owner panel ──
+    # This prevents owners from accidentally entering the buyer flow by clicking their own link
+    owner_shop = get_client_by_owner(message.chat.id)
+    if owner_shop:
+        set_commands_for_user(message.chat.id, is_owner=True)
+        shop_link = f"https://t.me/{BOT_USERNAME}?start={owner_shop['slug']}"
+        bot.send_message(
+            message.chat.id,
+            f"👋 *Welcome back, {owner_shop['name']} owner!*\n\n"
+            f"🔗 Your shop link:\n`{shop_link}`\n\nUse the buttons below 👇",
+            parse_mode="Markdown", reply_markup=owner_reply_kb()
         )
         return
 
@@ -579,20 +596,24 @@ def handle_pasted_link(message):
 @bot.callback_query_handler(func=lambda c: c.data == "home")
 def go_home(call):
     bot.answer_callback_query(call.id)
-    set_state(call.message.chat.id, STATE_IDLE)
-    shop = get_shop_for_session(call.message.chat.id)
+    chat_id = call.message.chat.id
+    set_state(chat_id, STATE_IDLE)
+
+    # Owners should never land on the buyer home screen
+    if get_client_by_owner(chat_id):
+        bot.send_message(chat_id, "👇 Use the buttons below:", reply_markup=owner_reply_kb())
+        return
+
+    shop = get_shop_for_session(chat_id)
     if not shop:
-        bot.send_message(call.message.chat.id,
+        bot.send_message(chat_id,
                          "⚠️ Session expired. Please open your shop link again.")
         return
-    lang = get_lang(call.message.chat.id)
-    # Always send fresh welcome with buyer keyboard (can't edit photo messages, and
-    # we need to ensure the persistent keyboard is always visible)
     try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.delete_message(chat_id, call.message.message_id)
     except Exception:
         pass
-    send_welcome(call.message.chat.id, shop, reply_markup=home_kb(call.message.chat.id))
+    send_welcome(chat_id, shop, reply_markup=home_kb(chat_id))
 
 
 # ═══════════════════════════════════════════════════════
@@ -624,15 +645,12 @@ def set_language(call):
     except Exception:
         pass
 
-    # Send welcome with inline buttons — persistent kb set silently first
+    # Send welcome with buyer keyboard attached directly (no double-menu)
     text = build_welcome_text(shop)
     buyer_kb = buyer_reply_kb(lang)
-    try:
-        kb_msg = bot.send_message(call.message.chat.id, ".", reply_markup=buyer_kb)
-        bot.delete_message(call.message.chat.id, kb_msg.message_id)
-    except Exception:
-        pass
     bot.send_message(call.message.chat.id, text, parse_mode="Markdown",
+                     reply_markup=buyer_kb)
+    bot.send_message(call.message.chat.id, "👇 Choose an option:",
                      reply_markup=home_kb(call.message.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data == "change_language")
@@ -2791,11 +2809,16 @@ def handle_buyer_kb(message):
     """Handle buyer bottom keyboard button taps — works in every language."""
     # Security: if owner taps a button that matches a buyer label, ignore — owner kb handler covers them
     if get_client_by_owner(message.chat.id):
+        bot.send_message(message.chat.id,
+                         "👇 Use the buttons below:",
+                         reply_markup=owner_reply_kb())
         return
     s = load_session(message.chat.id)
     if not s:
+        # Remove the stale buyer keyboard since there's no active session
         bot.send_message(message.chat.id,
-                         "👋 Please open your shop link to start shopping.")
+                         "👋 Please open your shop link to start shopping.",
+                         reply_markup=ReplyKeyboardRemove())
         return
     action = _get_buyer_action(message.text, message.chat.id)
     lang = get_lang(message.chat.id)
