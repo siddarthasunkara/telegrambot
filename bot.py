@@ -18,7 +18,7 @@ from db import (
     save_review, get_shop_rating, get_product_rating,
     get_all_customers_of_client,
     flag_blocked_customer, is_customer_blocked,
-    decrement_stock
+    decrement_stock, restore_stock
 )
 from payments import build_payment_message, build_qr_bytes, build_upi_string, QR_AVAILABLE
 from languages import t, language_picker_keyboard, LANGUAGE_OPTIONS
@@ -27,6 +27,11 @@ import re
 import urllib.parse
 import json
 from datetime import datetime, timezone, timedelta
+
+import sys
+if not TELEGRAM_TOKEN:
+    print("❌ FATAL: TELEGRAM_TOKEN env var missing. Exiting.")
+    sys.exit(1)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, num_threads=4)
 
@@ -40,7 +45,6 @@ STATE_DATE     = "date"
 
 # ── Admin step states (in-memory only for owner flows) ──
 admin_sessions      = {}
-_used_saved_address = set()  # tracks customers who reused saved address (no overwrite)
 
 
 # ═══════════════════════════════════════════════════════
@@ -70,21 +74,26 @@ def is_shop_open(shop):
     o, c = shop.get("open_time"), shop.get("close_time")
     if not o or not c:
         return True
-    return o <= get_ist().strftime("%H:%M") <= c
+    now = get_ist().strftime("%H:%M")
+    if o <= c:
+        return o <= now <= c        # normal hours e.g. 09:00–21:00
+    else:
+        return now >= o or now <= c # midnight-spanning e.g. 22:00–02:00
 
-def validate_date(date_str):
-    today = get_ist().date()
-    s = date_str.strip().lower()
-    # Accept any "as soon as possible" equivalent
+def validate_date(date_str, min_lead_hours=0):
+    """Validate date string. Optionally enforce min_lead_hours ahead of now."""
+    now_ist = get_ist()
+    today   = now_ist.date()
+    s       = date_str.strip().lower()
     quick_words = [
         "today", "now", "asap", "urgent", "fast", "quick", "express",
-        "jaldi", "abhi", "aaj", "ee roju", "inni",           # hindi/telugu
-        "tomorrow", "kal", "repu", "naale", "nale",           # tomorrow words
+        "jaldi", "abhi", "aaj", "ee roju", "inni",
+        "tomorrow", "kal", "repu", "naale", "nale",
         "day after", "parso",
     ]
     if s in quick_words:
-        return True
-    # Accept numeric formats: 1 Mar, 01/03, 1-3-2025, 1 March, etc.
+        # quick words only valid if no lead-time requirement
+        return min_lead_hours == 0
     for fmt_str in ["%d %b", "%d/%m", "%d-%m-%Y", "%d %B", "%d-%m-%y",
                     "%d-%m", "%d.%m", "%d %b %Y", "%d %B %Y"]:
         try:
@@ -93,7 +102,16 @@ def validate_date(date_str):
                 parsed = parsed.replace(year=today.year)
             if parsed.date() < today:
                 parsed = parsed.replace(year=today.year + 1)
-            return parsed.date() >= today
+            if parsed.date() < today:
+                return False
+            if min_lead_hours:
+                # treat parsed date as start-of-day; check hours from now
+                parsed_dt = datetime(parsed.year, parsed.month, parsed.day,
+                                     tzinfo=now_ist.tzinfo)
+                hours_ahead = (parsed_dt - now_ist).total_seconds() / 3600
+                if hours_ahead < min_lead_hours:
+                    return False
+            return True
         except ValueError:
             continue
     return False
@@ -351,11 +369,13 @@ def start(message):
         return
 
     if not is_shop_open(shop):
+        # Use language from existing session (if any); default english for brand-new visitors
+        lang_for_closed = (existing or {}).get("language") or "english"
         closed_m = InlineKeyboardMarkup()
         closed_m.add(InlineKeyboardButton("ℹ️ About Shop", callback_data="about"))
         bot.send_message(
             message.chat.id,
-            t("english", "shop_closed",
+            t(lang_for_closed, "shop_closed",
               shop_name=shop["name"],
               open_time=shop.get("open_time",""),
               close_time=shop.get("close_time",""))
@@ -380,6 +400,7 @@ def start(message):
     )
 
     # First-time visitor — show language picker before welcome
+    # Session row is guaranteed to exist now (upsert above), so set_language can safely update it
     is_first_visit = not existing or not existing.get("language")
     if is_first_visit:
         bot.send_message(
@@ -456,14 +477,13 @@ def set_language(call):
         bot.answer_callback_query(call.id, "Unknown language.")
         return
 
-    # Save language to session
-    update_session(call.message.chat.id, language=lang)
+    # Always upsert — guarantees language is saved regardless of session state
+    upsert_session(call.message.chat.id, language=lang)
     bot.answer_callback_query(call.id, t(lang, "language_set"))
 
     # Now show welcome in chosen language
     shop = get_shop_for_session(call.message.chat.id)
     if not shop:
-        # Session may not exist yet (language picked before upsert) — re-read slug
         bot.send_message(call.message.chat.id,
                          "⚠️ Please open your shop link again.",
                          parse_mode="Markdown")
@@ -911,8 +931,9 @@ def checkout(call):
     profile = get_customer_profile(call.message.chat.id)
     if profile and profile.get("address") and profile.get("phone"):
         m = InlineKeyboardMarkup()
+        addr_preview = profile['address'][:35] + ("…" if len(profile['address']) > 35 else "")
         m.add(InlineKeyboardButton(
-            f"✅ Use saved: {profile['address'][:30]}...",
+            f"✅ Use saved: {addr_preview}",
             callback_data="use_saved_address"
         ))
         m.add(InlineKeyboardButton("📝 Enter new address", callback_data="new_address"))
@@ -948,8 +969,8 @@ def use_saved_address(call):
                    address=profile["address"],
                    phone=profile["phone"],
                    state=STATE_DATE)
-    # Flag in memory: this session reused saved address, don't overwrite on order
-    _used_saved_address.add(call.message.chat.id)
+    # Flag in session DB: reused saved address, don't overwrite on order
+    update_session(call.message.chat.id, used_saved_address=True)
     lang = get_lang(call.message.chat.id)
     bot.send_message(
         call.message.chat.id,
@@ -1015,7 +1036,7 @@ def get_phone(message):
                          reply_markup=cancel_kb(message.chat.id))
         return
     update_session(message.chat.id,
-                   phone=message.text.strip(),
+                   phone=phone,
                    state=STATE_DATE)
     bot.send_message(
         message.chat.id,
@@ -1027,21 +1048,16 @@ def get_phone(message):
 @bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_DATE)
 def get_date(message):
     date_input = (message.text or "").strip()
-    if not validate_date(date_input):
-        bot.send_message(message.chat.id,
-                         t(get_lang(message.chat.id), "invalid_date"),
-                         reply_markup=cancel_kb(message.chat.id))
-        return
+    shop       = get_shop_for_session(message.chat.id)
+    min_hours  = shop.get("min_lead_hours", 0) if shop else 0
 
-    s = load_session(message.chat.id)
-    shop = get_shop_for_session(message.chat.id)
-    min_hours = shop.get("min_lead_hours", 0) if shop else 0
-    if min_hours and date_input.lower() in ["today","now","asap","urgent","fast","quick","express","jaldi","abhi","aaj","ee roju","inni"]:
-        bot.send_message(
-            message.chat.id,
-            f"⚠️ This shop needs *{min_hours} hours* advance notice.\n\nPlease enter a future date:",
-            parse_mode="Markdown", reply_markup=cancel_kb(message.chat.id)
-        )
+    if not validate_date(date_input, min_lead_hours=min_hours):
+        if min_hours:
+            err = f"⚠️ This shop needs *{min_hours}h* advance notice. Enter a date at least {min_hours} hours from now:"
+        else:
+            err = t(get_lang(message.chat.id), "invalid_date")
+        bot.send_message(message.chat.id, err,
+                         parse_mode="Markdown", reply_markup=cancel_kb(message.chat.id))
         return
 
     update_session(message.chat.id,
@@ -1055,6 +1071,16 @@ def _show_order_summary(chat_id):
     shop = get_shop_for_session(chat_id)
     cart = get_cart(chat_id)
     if not s or not shop or not cart:
+        return
+    # Re-check shop hours at final confirmation — customer may have started checkout before closing
+    if not is_shop_open(shop):
+        lang = get_lang(chat_id)
+        bot.send_message(chat_id,
+                         t(lang, "shop_closed", shop_name=shop["name"],
+                           open_time=shop.get("open_time",""),
+                           close_time=shop.get("close_time","")),
+                         parse_mode="Markdown")
+        update_session(chat_id, state=STATE_IDLE)
         return
 
     dc = shop.get("delivery_charge", 0)
@@ -1106,16 +1132,24 @@ def pay_cod(call):
 # PLACE ORDER — called by pay_upi or pay_cod
 # ═══════════════════════════════════════════════════════
 
-_last_order_time = {}
+_last_order_time = {}  # in-memory cache; session DB is the durable fallback
 
 def _place_order(call, payment_method="upi"):
     """Internal: called after customer picks payment method."""
-    now  = time.time()
-    last = _last_order_time.get(call.message.chat.id, 0)
-    if now - last < 15:
+    now      = time.time()
+    # Fast in-memory check first
+    last_mem = _last_order_time.get(call.message.chat.id, 0)
+    if now - last_mem < 15:
+        bot.answer_callback_query(call.id, "⏳ Please wait before placing another order.", show_alert=True)
+        return
+    # DB-backed check — survives bot restarts
+    s_rl = load_session(call.message.chat.id)
+    last_db = float((s_rl or {}).get("last_order_time") or 0)
+    if now - last_db < 15:
         bot.answer_callback_query(call.id, "⏳ Please wait before placing another order.", show_alert=True)
         return
     _last_order_time[call.message.chat.id] = now
+    update_session(call.message.chat.id, last_order_time=str(now))
     s    = load_session(call.message.chat.id)
     cart = get_cart(call.message.chat.id)
     if not s or not cart:
@@ -1176,9 +1210,10 @@ def _place_order(call, payment_method="upi"):
         )
 
     # Save customer profile — only if they entered a NEW address (not using saved)
-    if call.message.chat.id not in _used_saved_address:
+    s_fresh = load_session(call.message.chat.id)
+    if not (s_fresh or {}).get("used_saved_address"):
         save_customer_profile(call.message.chat.id, cname, phone, address)
-    _used_saved_address.discard(call.message.chat.id)  # clear flag
+    update_session(call.message.chat.id, used_saved_address=False)  # clear flag
 
     # ── Payment section ──────────────────────────────
     pay_badge = "💵 Cash on Delivery" if payment_method == "cod" else "📲 UPI / GPay"
@@ -1242,45 +1277,30 @@ def _place_order(call, payment_method="upi"):
                      parse_mode="Markdown", reply_markup=m)
 
     # ── UPI Payment ────────────────────────────────────
-    if payment_method == "upi" and shop.get("upi_id") and upi_string:
-        # Telegram only allows https:// URLs in inline buttons.
-        # Use intent-style HTTPS links — they open the UPI app on Android via browser.
-        upi_id = shop.get("upi_id","")
-        amount_val = fmt(total)
-        qs = urllib.parse.urlencode({
-            "pa": upi_id,
-            "pn": shop["name"][:20],
-            "am": amount_val,
-            "cu": "INR",
-            "tn": order_ref
-        })
-        pm = InlineKeyboardMarkup(row_width=2)
-        pm.add(
-            InlineKeyboardButton("💚 Pay via GPay",     url=f"https://pay.google.com/gp/v/pay?{qs}"),
-            InlineKeyboardButton("💜 Pay via PhonePe",  url=f"https://phpe.in/pay?{qs}"),
+    if payment_method == "upi" and shop.get("upi_id"):
+        # Show UPI ID clearly + QR code if available
+        # Note: Telegram inline buttons cannot open UPI apps directly (upi:// blocked)
+        # Best experience: show QR code (customer scans in any UPI app) + UPI ID to copy
+        upi_id_val = shop.get("upi_id","")
+        upi_caption = (
+            f"{pay_section}\n\n"
+            f"📋 *UPI ID:* `{upi_id_val}`\n"
+            f"_Open any UPI app → Scan QR or pay to UPI ID above_"
         )
-        pm.add(InlineKeyboardButton("🔵 Pay via Paytm", url=f"https://paytm.com/pay?{qs}"))
-
-        # Try QR code first — best method, works in all apps
-        qr_buf = build_qr_bytes(upi_string)
+        qr_buf = build_qr_bytes(upi_string) if upi_string else None
         if qr_buf:
             try:
-                bot.send_photo(
-                    call.message.chat.id,
-                    qr_buf,
-                    caption=pay_section,
-                    parse_mode="Markdown",
-                    reply_markup=pm
-                )
+                bot.send_photo(call.message.chat.id, qr_buf,
+                               caption=upi_caption, parse_mode="Markdown")
             except Exception:
-                bot.send_message(call.message.chat.id, pay_section,
-                                 parse_mode="Markdown", reply_markup=pm)
+                bot.send_message(call.message.chat.id, upi_caption, parse_mode="Markdown")
         else:
-            # qrcode not installed — text with buttons
-            bot.send_message(call.message.chat.id, pay_section,
-                             parse_mode="Markdown", reply_markup=pm)
+            bot.send_message(call.message.chat.id, upi_caption, parse_mode="Markdown")
     elif payment_method == "cod":
         bot.send_message(call.message.chat.id, pay_section, parse_mode="Markdown")
+
+    # Mark payment status based on method
+    update_payment_status(order["id"], "paid" if payment_method == "upi" else "pending")
 
     # Clear cart
     set_cart(call.message.chat.id, [])
@@ -1338,15 +1358,26 @@ def customer_cancel_order(call):
         bot.answer_callback_query(call.id, "This order can no longer be cancelled.", show_alert=True)
         return
     update_order_status(order_id, "cancelled")
+    # Restore stock for every item
+    for item in order.get("items", []):
+        restore_stock(
+            product_id=item.get("product_id"),
+            variant_id=item.get("variant_id"),
+            qty=int(item.get("quantity", 1))
+        )
     bot.answer_callback_query(call.id, "✅ Order cancelled.")
     ref = order.get("order_ref", order_id[:6])
-    # Notify owner
+    # Notify owner with item details
     s = load_session(call.message.chat.id)
     if s:
         shop = get_shop_for_session(call.message.chat.id)
         if shop:
+            items_str = ", ".join([
+                f"{i['name']}{' ('+i.get('variant_label','')+')' if i.get('variant_label') else ''}"
+                for i in order.get("items", [])
+            ]) or "—"
             safe_send(shop["owner_telegram"],
-                      f"ℹ️ Customer cancelled order *{ref}*.",
+                      f"ℹ️ Customer cancelled order *{ref}*\n📦 {md(items_str)}\n💰 ₹{fmt(order.get('total',0))}",
                       parse_mode="Markdown")
     bot.send_message(call.message.chat.id,
                      f"✅ Order *{ref}* has been cancelled.",
@@ -1386,7 +1417,7 @@ def reorder(call):
             "variant_id":    i.get("variant_id"),
             "name":          i["name"],
             "variant_label": i.get("variant_label",""),
-            "price":         float(i["price"]),
+            "price":         float(product["price"]),  # current price, not old
             "quantity":      int(i.get("quantity",1))
         })
 
@@ -1451,7 +1482,19 @@ def owner_cancel(call):
     _, order_id, cid = call.data.split("|")
     customer_id = int(cid)
 
+    order = get_order_by_id(order_id)
+    if not order or order.get("status") == "cancelled":
+        bot.answer_callback_query(call.id, "Already cancelled.", show_alert=True)
+        return
+
     update_order_status(order_id, "cancelled")
+    # Restore stock for every item
+    for item in order.get("items", []):
+        restore_stock(
+            product_id=item.get("product_id"),
+            variant_id=item.get("variant_id"),
+            qty=int(item.get("quantity", 1))
+        )
     bot.answer_callback_query(call.id, "❌ Cancelled.")
     try:
         bot.edit_message_reply_markup(call.message.chat.id,
@@ -1833,16 +1876,18 @@ def bc_confirm(call):
         if photo_id:
             try:
                 bot.send_photo(int(c["customer_telegram"]), photo_id,
-                               caption=f"📢 *{shop['name']}*\n{DIV}\n{text}",
+                               caption=f"📢 *{md(shop['name'])}*\n{DIV}\n{md(text)}" if text else f"📢 *{md(shop['name'])}*",
                                parse_mode="Markdown")
                 success += 1
                 continue
             except Exception:
                 pass
-        if safe_send(int(c["customer_telegram"]),
-                     f"📢 *{shop['name']}*\n{DIV}\n{text}",
+        if text and safe_send(int(c["customer_telegram"]),
+                     f"📢 *{md(shop['name'])}*\n{DIV}\n{md(text)}",
                      parse_mode="Markdown"):
             success += 1
+        elif not text:
+            success += 1  # photo-only already counted above
         time.sleep(0.05)
     bot.send_message(call.message.chat.id,
                      f"\u2705 *Done!* Sent to {success}/{len(customers)} customers.",

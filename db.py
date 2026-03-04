@@ -8,6 +8,11 @@ from config import SUPABASE_URL, SUPABASE_KEY
 import re
 import json
 
+import sys
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌ FATAL: SUPABASE_URL or SUPABASE_KEY env vars missing. Exiting.")
+    sys.exit(1)
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -167,31 +172,35 @@ def delete_product(client_id, product_id):
         return False
 
 def decrement_stock(product_id, variant_id=None, qty=1):
-    """Atomic stock decrement — prevents oversell"""
+    """Atomic stock decrement — the RPC handles WHERE stock >= qty, no oversell."""
     try:
         if variant_id:
-            # Check variant stock
-            r = supabase.table("product_variants").select(
-                "stock"
-            ).eq("id", variant_id).execute()
-            if not r.data or r.data[0]["stock"] < qty:
-                return False
             supabase.rpc("decrement_variant_stock", {
                 "v_id": variant_id, "qty": qty
             }).execute()
         else:
-            # Check product stock
-            r = supabase.table("products").select(
-                "stock"
-            ).eq("id", product_id).execute()
-            if not r.data or r.data[0]["stock"] < qty:
-                return False
             supabase.rpc("decrement_product_stock", {
                 "p_id": product_id, "qty": qty
             }).execute()
         return True
     except Exception as e:
         print(f"DB error decrement_stock: {e}")
+        return False
+
+def restore_stock(product_id, variant_id=None, qty=1):
+    """Restore stock when an order is cancelled."""
+    try:
+        if variant_id:
+            supabase.rpc("restore_variant_stock", {
+                "v_id": int(variant_id), "qty": int(qty)
+            }).execute()
+        else:
+            supabase.rpc("restore_product_stock", {
+                "p_id": int(product_id), "qty": int(qty)
+            }).execute()
+        return True
+    except Exception as e:
+        print(f"DB error restore_stock: {e}")
         return False
 
 def get_categories(client_id):
@@ -257,17 +266,21 @@ def delete_variants(product_id):
 # ───────────────────────────────────────────
 
 def _get_next_order_number(client_id):
-    """Atomic-safe order number per shop"""
-    try:
-        r = supabase.table("orders").select(
-            "order_number"
-        ).eq("client_id", client_id).order(
-            "order_number", desc=True
-        ).limit(1).execute()
-        return (r.data[0]["order_number"] + 1) if r.data else 1
-    except Exception as e:
-        print(f"DB error get_next_order_number: {e}")
-        return 1
+    """Get next order number. Not fully atomic but collision only affects display label —
+    the real unique key is order_ref (uuid-based)."""
+    import random as _rnd, time as _t
+    for attempt in range(3):
+        try:
+            r = supabase.table("orders").select(
+                "order_number"
+            ).eq("client_id", client_id).order(
+                "order_number", desc=True
+            ).limit(1).execute()
+            return (r.data[0]["order_number"] + 1) if r.data else 1
+        except Exception as e:
+            print(f"DB error get_next_order_number attempt {attempt}: {e}")
+            _t.sleep(_rnd.uniform(0.1, 0.3))
+    return int(_t.time()) % 100000  # timestamp fallback
 
 def create_order(client_id, customer_name, customer_telegram_id,
                  cart_items, subtotal, delivery_charge, total,
@@ -408,20 +421,18 @@ def get_order_by_id(order_id):
         return None
 
 def get_client_stats(client_id):
+    """Use per-status queries to avoid loading all rows into memory."""
     try:
-        r = supabase.table("orders").select(
-            "total,status"
-        ).eq("client_id", client_id).execute()
-        orders  = r.data or []
-        total_orders   = len(orders)
-        total_revenue  = sum(o["total"] for o in orders if o["status"] in ["confirmed","delivered"])
-        pending        = sum(1 for o in orders if o["status"] == "pending")
-        delivered      = sum(1 for o in orders if o["status"] == "delivered")
+        all_r  = supabase.table("orders").select("id", count="exact").eq("client_id", client_id).execute()
+        pend_r = supabase.table("orders").select("id", count="exact").eq("client_id", client_id).eq("status","pending").execute()
+        delv_r = supabase.table("orders").select("id", count="exact").eq("client_id", client_id).eq("status","delivered").execute()
+        rev_r  = supabase.table("orders").select("total").eq("client_id", client_id).in_("status",["confirmed","delivered"]).execute()
+        total_revenue = sum(o["total"] for o in (rev_r.data or []))
         return {
-            "total_orders":  total_orders,
+            "total_orders":  all_r.count  or 0,
             "total_revenue": total_revenue,
-            "pending":       pending,
-            "delivered":     delivered
+            "pending":       pend_r.count or 0,
+            "delivered":     delv_r.count or 0
         }
     except Exception as e:
         print(f"DB error get_client_stats: {e}")
@@ -443,18 +454,20 @@ def get_session(chat_id):
         return None
 
 def upsert_session(chat_id, shop_id=None, cart=None,
-                   state="idle", address="", phone="", delivery_date=""):
+                   state="idle", address="", phone="", delivery_date="",
+                   language=None):
     try:
         data = {
-            "chat_id":       int(chat_id),
-            "state":         state,
-            "updated_at":    "now()"
+            "chat_id":    int(chat_id),
+            "state":      state,
+            "updated_at": "now()"
         }
-        if shop_id      is not None: data["shop_id"]       = shop_id
-        if cart         is not None: data["cart"]          = cart
-        if address      is not None: data["address"]       = address
-        if phone        is not None: data["phone"]         = phone
+        if shop_id       is not None: data["shop_id"]       = shop_id
+        if cart          is not None: data["cart"]          = cart
+        if address       is not None: data["address"]       = address
+        if phone         is not None: data["phone"]         = phone
         if delivery_date is not None: data["delivery_date"] = delivery_date
+        if language      is not None: data["language"]      = language
 
         supabase.table("sessions").upsert(data).execute()
         return True
@@ -517,13 +530,13 @@ def save_customer_profile(chat_id, name, phone, address):
 
 def save_review(client_id, customer_telegram, order_id, rating, product_id=None):
     try:
-        supabase.table("reviews").insert({
+        supabase.table("reviews").upsert({
             "client_id":         client_id,
             "product_id":        product_id,
             "order_id":          order_id,
             "customer_telegram": str(customer_telegram),
             "rating":            int(rating)
-        }).execute()
+        }, on_conflict="order_id,product_id,customer_telegram").execute()
 
         # Update product rating cache
         if product_id:
@@ -574,9 +587,10 @@ def get_product_rating(product_id):
 
 def get_all_customers_of_client(client_id):
     try:
+        # Only customers with at least one non-cancelled order
         r = supabase.table("orders").select(
             "customer_telegram,customer_name"
-        ).eq("client_id", client_id).execute()
+        ).eq("client_id", client_id).in_("status", ["pending","confirmed","delivered"]).execute()
         seen, customers = set(), []
         for row in r.data:
             tid = row.get("customer_telegram")

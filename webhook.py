@@ -14,7 +14,7 @@ Deploy on Render as a second service, or run alongside bot.py using threads.
 from flask import Flask, request, jsonify
 import telebot
 from config import TELEGRAM_TOKEN, WEBHOOK_SECRET, BOT_USERNAME
-from db import create_client
+from db import create_client, get_client_by_slug
 import re
 import json
 
@@ -78,16 +78,27 @@ def tally_webhook():
     if not business_name or not owner_telegram:
         return jsonify({"error": "Missing required fields: business name + telegram id"}), 400
 
+    # Strip @ if owner accidentally entered @username style
+    owner_telegram = owner_telegram.lstrip("@").strip()
     try:
         owner_telegram_id = int(owner_telegram)
     except ValueError:
-        return jsonify({"error": "telegram id must be a numeric Telegram user ID"}), 400
+        return jsonify({
+            "error": "telegram id must be your numeric Telegram user ID (not @username). "
+                     "Find it by messaging @userinfobot on Telegram."
+        }), 400
+
+    # Deduplication: if this owner already has a shop, return existing link
+    from db import get_client_by_owner
+    existing_shop = get_client_by_owner(owner_telegram_id)
+    if existing_shop:
+        shop_link = f"https://t.me/{BOT_USERNAME}?start={existing_shop['slug']}"
+        return jsonify({"success": True, "shop_link": shop_link, "note": "existing shop"}), 200
 
     slug = slugify(business_name)
     # Collision guard: append number if slug taken
     base_slug = slug
     for n in range(2, 100):
-        from db import get_client_by_slug
         if not get_client_by_slug(slug):
             break
         slug = f"{base_slug}-{n}"
@@ -112,6 +123,16 @@ def tally_webhook():
     )
 
     if not client:
+        # Alert platform admin
+        try:
+            from config import ADMIN_TELEGRAM_ID
+            bot.send_message(
+                int(ADMIN_TELEGRAM_ID),
+                f"❌ *Onboarding failed!*\nShop: {business_name}\nOwner ID: {owner_telegram_id}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
         return jsonify({"error": "Failed to create client"}), 500
 
     shop_link = f"https://t.me/{BOT_USERNAME}?start={slug}"
