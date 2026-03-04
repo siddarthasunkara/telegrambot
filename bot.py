@@ -291,8 +291,8 @@ def build_welcome_text(shop):
 
 def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
     """Send welcome message for buyers.
-    - Attaches the persistent buyer ReplyKeyboard directly to the welcome message.
-    - This avoids the double-menu issue caused by the old send+delete pattern.
+    - Uses ONLY the buyer ReplyKeyboard (bottom persistent buttons).
+    - The inline home_kb (reply_markup) is intentionally NOT sent separately to avoid double-menu.
     - Owners must never be passed into this function.
     """
     # Safety guard: never show buyer keyboard to owners
@@ -303,10 +303,10 @@ def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
     lang = get_lang(chat_id)
     buyer_kb = buyer_reply_kb(lang)
 
-    # If we need to dismiss a stale keyboard first, do so silently
+    # Dismiss any stale keyboard silently before showing new one
     if remove_reply_kb:
         try:
-            msg = bot.send_message(chat_id, ".", reply_markup=ReplyKeyboardRemove())
+            msg = bot.send_message(chat_id, "\u200b", reply_markup=ReplyKeyboardRemove())
             bot.delete_message(chat_id, msg.message_id)
         except Exception:
             pass
@@ -314,21 +314,15 @@ def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
     photo = shop.get("shop_photo", "")
     if photo:
         try:
-            # Send photo with the persistent buyer keyboard attached
+            # Send photo with buyer keyboard — single message, no second message
             bot.send_photo(chat_id, photo, caption=text,
                            parse_mode="Markdown", reply_markup=buyer_kb)
-            # Also send inline home buttons separately (can't mix ReplyKeyboard + InlineKeyboard)
-            if reply_markup:
-                bot.send_message(chat_id, "👇 What would you like to do?",
-                                 reply_markup=reply_markup)
             return
         except Exception as e:
             print(f"Failed to send shop photo: {e}")
 
-    # No photo — send welcome with buyer keyboard, then inline buttons
+    # No photo — single welcome message with buyer keyboard only
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=buyer_kb)
-    if reply_markup:
-        bot.send_message(chat_id, "👇 Choose an option:", reply_markup=reply_markup)
 
 def parse_slug_from_input(text):
     """
@@ -645,13 +639,11 @@ def set_language(call):
     except Exception:
         pass
 
-    # Send welcome with buyer keyboard attached directly (no double-menu)
+    # Send welcome with buyer keyboard attached — single message only
     text = build_welcome_text(shop)
     buyer_kb = buyer_reply_kb(lang)
     bot.send_message(call.message.chat.id, text, parse_mode="Markdown",
                      reply_markup=buyer_kb)
-    bot.send_message(call.message.chat.id, "👇 Choose an option:",
-                     reply_markup=home_kb(call.message.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data == "change_language")
 def change_language(call):
@@ -2785,20 +2777,13 @@ def _get_buyer_action(text, chat_id):
     return mapping.get(text)
 
 # Pre-built set of ALL possible buyer keyboard labels across all languages.
-# Used as a fast first-pass filter so we only hit the DB when text could be a buyer button.
+# Built dynamically from t() so it ALWAYS matches what buyer_reply_kb() actually renders.
+_BUYER_LABEL_KEYS = ("browse", "cart", "my_orders", "about", "change_language")
 _ALL_BUYER_LABELS = {
-    "🛍 Browse Products", "🛍 प्रोडक्ट देखें", "🛍 పొడక్ట్స్ చూడండి",
-    "🛍 ప్రొడక్ట్స్ చూడండి", "🛍 ಉತ್ಪನ್ನಗಳನ್ನು ನೋಡಿ", "🛍 பொருட்களை பார்க்க",
-    "🛍 ഉൽപ്പന്നങ്ങൾ കാണുക",
-    "🛒 My Cart", "🛒 मेरी कार्ट", "🛒 నా కార్ట్", "🛒 ನನ್ನ ಕಾರ್ಟ್",
-    "🛒 என் கார்ட்", "🛒 എന്റെ കാർട്ട്",
-    "📦 My Orders", "📦 मेरे ऑर्डर", "📦 నా ఆర్డర్లు", "📦 ನನ್ನ ಆರ್ಡರ್\u200cಗಳು",
-    "📦 என் ஆர்டர்கள்", "📦 എന്റെ ഓർഡറുകൾ",
-    "ℹ️ About", "ℹ️ शॉप के बारे में", "ℹ️ షాప్ గురించి", "ℹ️ ಅಂಗಡಿ ಬಗ್ಗೆ",
-    "ℹ️ கடை பற்றி", "ℹ️ കടയെക്കുറിച്ച്",
-    "🌐 Language", "🌐 भाषा", "🌐 భాష", "🌐 ಭಾಷೆ", "🌐 மொழி", "🌐 ഭാഷ",
+    t(lang, key)
+    for lang in ("english", "hindi", "telugu", "kannada", "tamil", "malayalam")
+    for key in _BUYER_LABEL_KEYS
 }
-
 @bot.message_handler(func=lambda msg: (
     msg.text is not None and
     msg.text in _ALL_BUYER_LABELS and
@@ -2935,29 +2920,31 @@ def unknown_message(message):
         handle_pasted_link(message)
         return
 
-    # Check if owner — show owner kb
-    shop = get_client_by_owner(message.chat.id)
-    if shop:
+    # ── Check buyer session FIRST ──
+    # A user in an active buyer session must NEVER be redirected to the owner panel,
+    # even if they also happen to be a registered shop owner.
+    s = load_session(message.chat.id)
+    if s:
+        shop = get_shop_for_session(message.chat.id)
+        if shop:
+            send_welcome(message.chat.id, shop)
+        else:
+            bot.send_message(message.chat.id,
+                             "⚠️ Session expired. Please open your shop link again.",
+                             reply_markup=ReplyKeyboardRemove())
+        return
+
+    # No buyer session — check if owner
+    owner_shop = get_client_by_owner(message.chat.id)
+    if owner_shop:
         bot.send_message(message.chat.id,
                          "👇 Use the buttons below:",
                          reply_markup=owner_reply_kb())
         return
 
-    s = load_session(message.chat.id)
-    lang = get_lang(message.chat.id)
-    if s:
-        shop = get_shop_for_session(message.chat.id)
-        if shop:
-            # Re-show the welcome screen with full keyboard
-            send_welcome(message.chat.id, shop,
-                         reply_markup=home_kb(message.chat.id))
-        else:
-            bot.send_message(message.chat.id,
-                             "⚠️ Session expired. Please open your shop link again.",
-                             reply_markup=ReplyKeyboardRemove())
-    else:
-        bot.send_message(message.chat.id,
-                         "👋 Use your shop link to get started,\nor type /help if you're a shop owner.")
+    # Complete stranger — no session, not an owner
+    bot.send_message(message.chat.id,
+                     "👋 Use your shop link to get started,\nor type /help if you're a shop owner.")
 
 
 # ═══════════════════════════════════════════════════════
