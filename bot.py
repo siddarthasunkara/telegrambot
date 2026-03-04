@@ -289,39 +289,27 @@ def build_welcome_text(shop):
         f"What would you like today?"
     )
 
-def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
-    """Send welcome message for buyers.
-    - Uses ONLY the buyer ReplyKeyboard (bottom persistent buttons).
-    - The inline home_kb (reply_markup) is intentionally NOT sent separately to avoid double-menu.
-    - Owners must never be passed into this function.
+def send_welcome(chat_id, shop):
+    """Send ONE welcome message to the buyer with the persistent bottom keyboard.
+    - Never called for owners.
+    - No second message. No double menu. Ever.
     """
-    # Safety guard: never show buyer keyboard to owners
     if get_client_by_owner(chat_id):
-        return
+        return  # hard guard — owners must never get buyer keyboard
 
-    text = build_welcome_text(shop)
-    lang = get_lang(chat_id)
+    text     = build_welcome_text(shop)
+    lang     = get_lang(chat_id)
     buyer_kb = buyer_reply_kb(lang)
-
-    # Dismiss any stale keyboard silently before showing new one
-    if remove_reply_kb:
-        try:
-            msg = bot.send_message(chat_id, "\u200b", reply_markup=ReplyKeyboardRemove())
-            bot.delete_message(chat_id, msg.message_id)
-        except Exception:
-            pass
 
     photo = shop.get("shop_photo", "")
     if photo:
         try:
-            # Send photo with buyer keyboard — single message, no second message
             bot.send_photo(chat_id, photo, caption=text,
                            parse_mode="Markdown", reply_markup=buyer_kb)
             return
         except Exception as e:
             print(f"Failed to send shop photo: {e}")
 
-    # No photo — single welcome message with buyer keyboard only
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=buyer_kb)
 
 def parse_slug_from_input(text):
@@ -562,8 +550,7 @@ def start(message):
             t(lang, "welcome_back_cart", n=n, word=items_word),
             parse_mode="Markdown"
         )
-    send_welcome(message.chat.id, shop, reply_markup=home_kb(message.chat.id),
-                 remove_reply_kb=True)
+    send_welcome(message.chat.id, shop)
 
 
 # ── Handle pasted shop links in chat ────────────────
@@ -607,7 +594,7 @@ def go_home(call):
         bot.delete_message(chat_id, call.message.message_id)
     except Exception:
         pass
-    send_welcome(chat_id, shop, reply_markup=home_kb(chat_id))
+    send_welcome(chat_id, shop)
 
 
 # ═══════════════════════════════════════════════════════
@@ -639,11 +626,7 @@ def set_language(call):
     except Exception:
         pass
 
-    # Send welcome with buyer keyboard attached — single message only
-    text = build_welcome_text(shop)
-    buyer_kb = buyer_reply_kb(lang)
-    bot.send_message(call.message.chat.id, text, parse_mode="Markdown",
-                     reply_markup=buyer_kb)
+    send_welcome(call.message.chat.id, shop)
 
 @bot.callback_query_handler(func=lambda c: c.data == "change_language")
 def change_language(call):
@@ -2750,7 +2733,7 @@ def handle_owner_kb(message):
         if s:
             shop = get_shop_for_session(message.chat.id)
             if shop:
-                send_welcome(message.chat.id, shop, reply_markup=home_kb(message.chat.id))
+                send_welcome(message.chat.id, shop)
                 return
         bot.send_message(message.chat.id,
                          "😊 Use your shop link to get started.",
@@ -2776,8 +2759,7 @@ def _get_buyer_action(text, chat_id):
     }
     return mapping.get(text)
 
-# Pre-built set of ALL possible buyer keyboard labels across all languages.
-# Built dynamically from t() so it ALWAYS matches what buyer_reply_kb() actually renders.
+# Built dynamically from t() — always matches buyer_reply_kb() exactly in every language.
 _BUYER_LABEL_KEYS = ("browse", "cart", "my_orders", "about", "change_language")
 _ALL_BUYER_LABELS = {
     t(lang, key)
@@ -2920,9 +2902,9 @@ def unknown_message(message):
         handle_pasted_link(message)
         return
 
-    # ── Check buyer session FIRST ──
-    # A user in an active buyer session must NEVER be redirected to the owner panel,
-    # even if they also happen to be a registered shop owner.
+    # ── SESSION CHECK FIRST ──────────────────────────────────────────────────
+    # A buyer with an active session must NEVER be shown the owner panel,
+    # even if the same Telegram account is also a registered shop owner.
     s = load_session(message.chat.id)
     if s:
         shop = get_shop_for_session(message.chat.id)
@@ -2934,17 +2916,17 @@ def unknown_message(message):
                              reply_markup=ReplyKeyboardRemove())
         return
 
-    # No buyer session — check if owner
-    owner_shop = get_client_by_owner(message.chat.id)
-    if owner_shop:
+    # ── OWNER CHECK — only if no buyer session ──────────────────────────────
+    if get_client_by_owner(message.chat.id):
         bot.send_message(message.chat.id,
                          "👇 Use the buttons below:",
                          reply_markup=owner_reply_kb())
         return
 
-    # Complete stranger — no session, not an owner
+    # ── Total stranger — no session, not an owner ────────────────────────────
     bot.send_message(message.chat.id,
-                     "👋 Use your shop link to get started,\nor type /help if you're a shop owner.")
+                     "👋 Use your shop link to start shopping.\n"
+                     "Are you a shop owner? Type /help")
 
 
 # ═══════════════════════════════════════════════════════
