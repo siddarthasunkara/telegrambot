@@ -56,17 +56,24 @@ OWNER_COMMANDS = [
     BotCommand("cancel",       "❌ Cancel"),
 ]
 
-# Default global commands = buyer-only (safe fallback for anyone not yet scoped)
+# Delete global default commands entirely — prevents ANY command showing to
+# unscoped users (new users before their first /start with a slug).
+# Per-user scoped commands are set on /start (buyers) and /help or /stats (owners).
 try:
-    bot.set_my_commands(BUYER_COMMANDS)
+    bot.delete_my_commands()  # removes global fallback completely
+except Exception:
+    pass
+# Also clear any previously set global commands from old deploys
+try:
+    bot.set_my_commands([])
 except Exception:
     pass
 
 def set_commands_for_user(chat_id, is_owner=False):
-    """Set scoped commands so owners see owner menu, buyers see buyer menu only."""
+    """Set per-user scoped commands. Owners get full panel, buyers get minimal."""
     try:
         cmds = OWNER_COMMANDS if is_owner else BUYER_COMMANDS
-        bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id))
+        bot.set_my_commands(cmds, scope=BotCommandScopeChat(int(chat_id)))
     except Exception as e:
         print(f"set_commands_for_user failed for {chat_id}: {e}")
 
@@ -283,35 +290,44 @@ def build_welcome_text(shop):
     )
 
 def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
-    """Send welcome with buyer persistent keyboard.
-    No photo: buyer kb + inline buttons on same message.
-    With photo: buyer kb on photo, inline on a follow-up (Telegram limitation)."""
+    """Send welcome.
+    - Persistent buyer reply keyboard shown ONCE (silently, then deleted if remove_reply_kb).
+    - Welcome message carries ONLY the inline buttons (home_kb).
+    - This prevents the double-menu issue where buyer sees keyboard twice in chat.
+    """
     text = build_welcome_text(shop)
     lang = get_lang(chat_id)
     buyer_kb = buyer_reply_kb(lang)
 
+    # Always set the persistent bottom keyboard first (silently)
+    # If remove_reply_kb: dismiss old keyboard first, then set new one
     if remove_reply_kb:
         try:
-            msg = bot.send_message(chat_id, "🛍", reply_markup=ReplyKeyboardRemove())
+            msg = bot.send_message(chat_id, ".", reply_markup=ReplyKeyboardRemove())
             bot.delete_message(chat_id, msg.message_id)
         except Exception:
             pass
 
+    # Send the persistent buyer keyboard once — silently (deleted immediately)
+    # This ensures the bottom keyboard is always set even when there's no prior message
+    try:
+        kb_msg = bot.send_message(chat_id, ".", reply_markup=buyer_kb)
+        bot.delete_message(chat_id, kb_msg.message_id)
+    except Exception:
+        pass
+
     photo = shop.get("shop_photo", "")
     if photo:
         try:
+            # Photo with inline buttons only (no reply_markup on photo = cleaner)
             bot.send_photo(chat_id, photo, caption=text,
-                           parse_mode="Markdown", reply_markup=buyer_kb)
-            if reply_markup:
-                bot.send_message(chat_id, "👇 Tap to browse:", reply_markup=reply_markup)
+                           parse_mode="Markdown", reply_markup=reply_markup)
             return
         except Exception as e:
             print(f"Failed to send shop photo: {e}")
 
-    # No photo — send welcome with persistent buyer kb
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=buyer_kb)
-    if reply_markup:
-        bot.send_message(chat_id, "👇", reply_markup=reply_markup)
+    # No photo — welcome text with inline buttons only
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
 
 def parse_slug_from_input(text):
     """
@@ -445,6 +461,11 @@ def start(message):
     if existing:
         update_session(message.chat.id, state=STATE_IDLE)
 
+    # Set scope immediately — owner check below may override to owner scope
+    # This ensures buyer scope is set even before welcome message is sent
+    is_owner_user = get_client_by_owner(message.chat.id) is not None
+    set_commands_for_user(message.chat.id, is_owner=is_owner_user)
+
     if not slug:
         # Check if this is a registered owner
         owner_shop = get_client_by_owner(message.chat.id)
@@ -507,9 +528,6 @@ def start(message):
         phone=existing.get("phone","") if existing else "",
         delivery_date=""
     )
-
-    # Set scoped menu commands — buyer sees browse/cancel, never owner commands
-    set_commands_for_user(message.chat.id, is_owner=False)
 
     # First-time visitor — show language picker before welcome
     # Session row is guaranteed to exist now (upsert above), so set_language can safely update it
@@ -606,11 +624,16 @@ def set_language(call):
     except Exception:
         pass
 
-    # Send welcome — pass lang explicitly so buyer_reply_kb uses the NEW language immediately
+    # Send welcome with inline buttons — persistent kb set silently first
     text = build_welcome_text(shop)
-    buyer_kb = buyer_reply_kb(lang)   # use new lang directly, not get_lang() which may be cached
-    bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=buyer_kb)
-    bot.send_message(call.message.chat.id, "👇", reply_markup=home_kb(call.message.chat.id))
+    buyer_kb = buyer_reply_kb(lang)
+    try:
+        kb_msg = bot.send_message(call.message.chat.id, ".", reply_markup=buyer_kb)
+        bot.delete_message(call.message.chat.id, kb_msg.message_id)
+    except Exception:
+        pass
+    bot.send_message(call.message.chat.id, text, parse_mode="Markdown",
+                     reply_markup=home_kb(call.message.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data == "change_language")
 def change_language(call):
