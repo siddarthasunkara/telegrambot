@@ -35,6 +35,48 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, num_threads=4)
 
+# Set bot command menu — shows in Menu button for all users
+from telebot.types import BotCommand, ReplyKeyboardMarkup, KeyboardButton
+try:
+    bot.set_my_commands([
+        BotCommand("start",        "🛍 Open shop"),
+        BotCommand("orders",       "📦 View orders"),
+        BotCommand("cancel",       "❌ Cancel checkout"),
+        BotCommand("help",         "⚙️ Owner commands"),
+        BotCommand("addproduct",   "➕ Add product"),
+        BotCommand("editproduct",  "✏️ Edit product"),
+        BotCommand("stats",        "📊 Stats"),
+        BotCommand("broadcast",    "📣 Broadcast"),
+    ])
+except Exception:
+    pass
+
+def skip_kb():
+    """Simple keyboard with just a Skip button for optional fields."""
+    m = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    m.add(KeyboardButton("⏭ Skip"))
+    return m
+
+def owner_reply_kb():
+    """Persistent bottom keyboard for owners."""
+    m = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
+    m.add(
+        KeyboardButton("📦 Orders"),
+        KeyboardButton("➕ Add Product"),
+        KeyboardButton("✏️ Edit Product"),
+    )
+    m.add(
+        KeyboardButton("📊 Stats"),
+        KeyboardButton("📣 Broadcast"),
+        KeyboardButton("🏷 Products"),
+    )
+    m.add(
+        KeyboardButton("🔗 Shop Link"),
+        KeyboardButton("🖼 Set Logo"),
+        KeyboardButton("❓ Help"),
+    )
+    return m
+
 DIV = "━━━━━━━━━━━━━━━"
 
 # ── Checkout states ──
@@ -86,10 +128,19 @@ def validate_date(date_str, min_lead_hours=0):
     today   = now_ist.date()
     s       = date_str.strip().lower()
     quick_words = [
+        # English
         "today", "now", "asap", "urgent", "fast", "quick", "express",
-        "jaldi", "abhi", "aaj", "ee roju", "inni",
-        "tomorrow", "kal", "repu", "naale", "nale",
-        "day after", "parso",
+        "tomorrow", "day after", "day after tomorrow",
+        # Hindi
+        "aaj", "abhi", "jaldi", "kal", "parso",
+        # Telugu
+        "ee roju", "inni", "repu", "nale", "taruvata",
+        # Kannada
+        "ivattu", "nale", "naale",
+        # Tamil
+        "indru", "naalai", "eppodu",
+        # Malayalam
+        "innu", "nale", "naale", "athram",
     ]
     if s in quick_words:
         # quick words only valid if no lead-time requirement
@@ -345,8 +396,8 @@ def start(message):
             bot.send_message(
                 message.chat.id,
                 f"👋 *Welcome back, {owner_shop['name']} owner!*\n\n"
-                f"🔗 Your shop link:\n`{shop_link}`\n\nUse /help for all commands.",
-                parse_mode="Markdown"
+                f"🔗 Your shop link:\n`{shop_link}`\n\nUse the buttons below 👇",
+                parse_mode="Markdown", reply_markup=owner_reply_kb()
             )
         else:
             bot.send_message(
@@ -643,13 +694,9 @@ def _send_product_card(chat_id, product):
     caption = f"*{product['name']}*"
     if product.get("category"):
         caption += f"  •  _{product['category']}_"
-
-    # Rating line
+    caption += f"\n💰 *₹{fmt(product['price'])}*"
     if rating:
-        caption += f"\n⭐ {rating}/5  ({rcount} sold)"
-
-    # Price
-    caption += f"\n💰 ₹{fmt(product['price'])}"
+        caption += f"  ⭐ {rating}/5"
     if product.get("description"):
         caption += f"\n_{product['description']}_"
 
@@ -994,14 +1041,13 @@ def new_address(call):
 @bot.callback_query_handler(func=lambda c: c.data == "cancel_checkout")
 def cancel_checkout(call):
     set_state(call.message.chat.id, STATE_IDLE)
-    bot.answer_callback_query(call.id, "Checkout cancelled")
-    m = InlineKeyboardMarkup(row_width=2)
     lang = get_lang(call.message.chat.id)
+    bot.answer_callback_query(call.id, t(lang, "checkout_cancelled"))
+    m = InlineKeyboardMarkup(row_width=2)
     m.add(
         InlineKeyboardButton(t(lang, "back_to_cart"), callback_data="cart"),
         InlineKeyboardButton(t(lang, "back_to_menu"), callback_data="home")
     )
-    lang = get_lang(call.message.chat.id)
     try_edit(call.message.chat.id, call.message.message_id,
              t(lang, "checkout_cancelled"), reply_markup=m)
 
@@ -1011,13 +1057,15 @@ def cancel_checkout(call):
 @bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_ADDRESS)
 def get_address(message):
     lang = get_lang(message.chat.id)
-    if not message.text or len(message.text.strip()) < 15:
+    # Allow any non-empty text — we just need SOMETHING typed
+    addr = (message.text or "").strip()
+    if not addr or len(addr) < 10:
         bot.send_message(message.chat.id,
                          t(lang, "invalid_address"),
                          reply_markup=cancel_kb(message.chat.id))
         return
     update_session(message.chat.id,
-                   address=message.text.strip(),
+                   address=addr,
                    state=STATE_PHONE)
     bot.send_message(
         message.chat.id,
@@ -1343,7 +1391,7 @@ def my_orders(call):
         text += f"{icon} *{ref}*\n   {items_str}\n   ₹{fmt(o['total'])} • {o['status'].title()}\n\n"
         if o["status"] == "pending":
             m.add(InlineKeyboardButton(f"❌ Cancel {ref}", callback_data=f"customer_cancel|{o['id']}"))
-        elif o["status"] in ["confirmed","delivered"]:
+        if o["status"] == "delivered":
             m.add(InlineKeyboardButton(f"🔄 Reorder {ref}", callback_data=f"reorder_{o['id']}"))
 
     m.add(InlineKeyboardButton("🏠 Back to Menu", callback_data="home"))
@@ -1761,7 +1809,7 @@ def stats(message):
         f"💰 Revenue: *₹{fmt(data['total_revenue'])}*\n"
         f"⭐ Rating: *{f'{rating}/5 ({rcount} reviews)' if rating else 'No reviews yet'}*\n"
         f"{DIV}",
-        parse_mode="Markdown", reply_markup=sm
+        parse_mode="Markdown", reply_markup=owner_reply_kb()
     )
 
 
@@ -1890,8 +1938,8 @@ def bc_confirm(call):
             success += 1  # photo-only already counted above
         time.sleep(0.05)
     bot.send_message(call.message.chat.id,
-                     f"\u2705 *Done!* Sent to {success}/{len(customers)} customers.",
-                     parse_mode="Markdown")
+                     f"✅ *Done!* Sent to {success}/{len(customers)} customers.",
+                     parse_mode="Markdown", reply_markup=owner_reply_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data == "bc_cancel")
 def bc_cancel(call):
@@ -1941,6 +1989,43 @@ def view_products(message):
                          reply_markup=vm if i+4000 >= len(text) else None)
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "ap_variants_no")
+def ap_variants_no_cb(call):
+    bot.answer_callback_query(call.id)
+    s = admin_sessions.get(call.message.chat.id)
+    if not s:
+        bot.send_message(call.message.chat.id, "⚠️ Session lost. Use /addproduct to restart.")
+        return
+    s["new_product"]["variants"] = []
+    bot.send_message(
+        call.message.chat.id,
+        "*Step 7 of 7* — Send a product photo 📸\n\n"
+        "_Open gallery and send the photo, or tap Skip_",
+        parse_mode="Markdown", reply_markup=skip_kb()
+    )
+    bot.register_next_step_handler(call.message, ap_photo)
+
+@bot.callback_query_handler(func=lambda c: c.data == "ap_variants_yes")
+def ap_variants_yes_cb(call):
+    bot.answer_callback_query(call.id)
+    s = admin_sessions.get(call.message.chat.id)
+    if not s:
+        bot.send_message(call.message.chat.id, "⚠️ Session lost. Use /addproduct to restart.")
+        return
+    s["new_product"]["variants"] = []
+    bot.send_message(
+        call.message.chat.id,
+        "Type your variants like this:\n\n"
+        "`500g:299, 1kg:499, 2kg:849`\n\n"
+        "Format: *name:price* — separated by commas\n\n"
+        "_Examples:_\n"
+        "• `S:199, M:249, L:299`\n"
+        "• `Eggless:399, With Egg:349`\n"
+        "• `500g:149, 1kg:279`",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(call.message, ap_variants)
+
 @bot.message_handler(commands=['addproduct'])
 def add_product_start(message):
     shop = get_client_by_owner(message.chat.id)
@@ -1986,8 +2071,8 @@ def ap_price(message):
         return
     s["new_product"]["price"] = price
     bot.send_message(message.chat.id,
-                     "*Step 3 of 7* — Category?\n_(e.g. Cakes, Cookies, Dresses)_\nOr type *skip*",
-                     parse_mode="Markdown")
+                     "*Step 3 of 7* — Category?\n_(e.g. Cakes, Cookies, Dresses)_\n\nOr tap Skip 👇",
+                     parse_mode="Markdown", reply_markup=skip_kb())
     bot.register_next_step_handler(message, ap_category)
 
 def ap_category(message):
@@ -1995,10 +2080,11 @@ def ap_category(message):
     if not s:
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
-    s["new_product"]["category"] = "" if (message.text or "").lower()=="skip" else (message.text or "").strip()
+    raw_cat = (message.text or "").strip()
+    s["new_product"]["category"] = "" if raw_cat.lower() in ("skip","⏭ skip") else raw_cat
     bot.send_message(message.chat.id,
-                     "*Step 4 of 7* — Description?\n_Short description or type *skip*_",
-                     parse_mode="Markdown")
+                     "*Step 4 of 7* — Description?\n_Short description — or tap Skip_",
+                     parse_mode="Markdown", reply_markup=skip_kb())
     bot.register_next_step_handler(message, ap_description)
 
 def ap_description(message):
@@ -2006,9 +2092,10 @@ def ap_description(message):
     if not s:
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
-    s["new_product"]["description"] = "" if (message.text or "").lower()=="skip" else (message.text or "").strip()
+    raw_desc = (message.text or "").strip()
+    s["new_product"]["description"] = "" if raw_desc.lower() in ("skip","⏭ skip") else raw_desc
     bot.send_message(message.chat.id,
-                     "*Step 5 of 7* — Stock quantity?\n_Type 99 for unlimited_",
+                     "*Step 5 of 7* — Stock quantity?\n_How many do you have? Type 99 for unlimited._",
                      parse_mode="Markdown")
     bot.register_next_step_handler(message, ap_stock)
 
@@ -2024,50 +2111,52 @@ def ap_stock(message):
         bot.register_next_step_handler(message, ap_stock)
         return
     s["new_product"]["stock"] = stock
+    vkb = InlineKeyboardMarkup(row_width=1)
+    vkb.add(
+        InlineKeyboardButton("✅ Yes, add sizes/weights/options", callback_data="ap_variants_yes"),
+        InlineKeyboardButton("⏭ No variants, skip",              callback_data="ap_variants_no"),
+    )
+    admin_sessions[message.chat.id] = s
     bot.send_message(
         message.chat.id,
-        "*Step 6 of 7* — Does this product have sizes or weights?\n\n"
-        "_Examples:_\n"
-        "• _500g, 1kg, 2kg_\n"
-        "• _S, M, L, XL_\n"
-        "• _Eggless, With Egg_\n\n"
-        "Type variants as: `label:price, label:price`\n"
-        "Example: `500g:299, 1kg:499, 2kg:849`\n\n"
-        "Or type *skip* if no variants.",
-        parse_mode="Markdown"
+        "*Step 6 of 7* — Does this product have sizes, weights or options?\n\n"
+        "_e.g. 500g / 1kg, S / M / L, Eggless / With Egg_",
+        parse_mode="Markdown", reply_markup=vkb
     )
-    bot.register_next_step_handler(message, ap_variants)
 
 def ap_variants(message):
     s = admin_sessions.get(message.chat.id)
     if not s:
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
-    if (message.text or "").lower() == "skip":
+    raw = (message.text or "").strip()
+    if raw.lower() in ("skip", "⏭ skip"):
         s["new_product"]["variants"] = []
     else:
         variants = []
         order    = 0
-        if not message.text:
-            bot.send_message(message.chat.id, "⚠️ Please type variant text or *skip*:", parse_mode="Markdown")
+        if not raw:
+            bot.send_message(message.chat.id, "⚠️ Please type variants or tap Skip:")
             bot.register_next_step_handler(message, ap_variants)
             return
-        for part in message.text.split(","):
+        for part in raw.split(","):
             part = part.strip()
             if ":" in part:
                 try:
-                    label, price = part.split(":", 1)
-                    variants.append({
-                        "label":      label.strip(),
-                        "price":      float(re.sub(r'[^\d.]', '', price)),
-                        "sort_order": order
-                    })
-                    order += 1
+                    label, price_str = part.split(":", 1)
+                    price_val = float(re.sub(r'[^\d.]', '', price_str))
+                    if label.strip() and price_val > 0:
+                        variants.append({
+                            "label":      label.strip(),
+                            "price":      price_val,
+                            "sort_order": order
+                        })
+                        order += 1
                 except Exception:
                     pass
         if not variants:
             bot.send_message(message.chat.id,
-                             "⚠️ Invalid format.\nUse: `500g:299, 1kg:499`\nOr type *skip*:",
+                             "⚠️ Couldn't read that.\n\nUse format: `500g:299, 1kg:499`\n\n_Label, colon, price — separated by commas_",
                              parse_mode="Markdown")
             bot.register_next_step_handler(message, ap_variants)
             return
@@ -2076,8 +2165,8 @@ def ap_variants(message):
     bot.send_message(
         message.chat.id,
         "*Step 7 of 7* — Send a product photo 📸\n\n"
-        "_Open gallery and send the photo._\n_Or type *skip*_",
-        parse_mode="Markdown"
+        "_Open gallery and send the photo — or tap Skip_",
+        parse_mode="Markdown", reply_markup=skip_kb()
     )
     bot.register_next_step_handler(message, ap_photo)
 
@@ -2088,11 +2177,11 @@ def ap_photo(message):
         return
     if message.photo:
         photo_id = message.photo[-1].file_id
-    elif message.text and message.text.lower() == "skip":
+    elif message.text and message.text.lower().replace("⏭ ","") == "skip":
         photo_id = ""
     else:
         bot.send_message(message.chat.id,
-                         "⚠️ Send a *photo* or type *skip*:", parse_mode="Markdown")
+                         "⚠️ Send a *photo* or tap Skip:", parse_mode="Markdown", reply_markup=skip_kb())
         bot.register_next_step_handler(message, ap_photo)
         return
 
@@ -2138,10 +2227,7 @@ def ap_photo(message):
         f"📷 Photo: {'✅' if photo_id else '❌'}\n"
         f"{DIV}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("➕ Add Another", callback_data="owner_addproduct"),
-            InlineKeyboardButton("📦 View All",    callback_data="owner_viewproducts")
-        )
+        reply_markup=owner_reply_kb()
     )
 
 
@@ -2153,104 +2239,157 @@ def edit_product_start(message):
         return
     products = get_products(shop["id"])
     if not products:
-        bot.send_message(message.chat.id, "No products. Use /addproduct first.")
+        bot.send_message(message.chat.id, "No products yet. Use /addproduct first.")
         return
-    text = f"✏️ *Edit Product*\n{DIV}\nSend the product ID:\n\n"
-    for p in products:
-        text += f"*ID {p['id']}* — {p['name']} — ₹{fmt(p['price'])}\n"
     admin_sessions[message.chat.id] = {"shop": shop}
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
-    bot.register_next_step_handler(message, ep_id)
+    # Show products as inline buttons — no typing needed
+    m = InlineKeyboardMarkup(row_width=1)
+    for p in products:
+        stock_icon = "❌" if p.get("stock",99)==0 else "✅"
+        m.add(InlineKeyboardButton(
+            f"{stock_icon} {p['name']} — ₹{fmt(p['price'])}",
+            callback_data=f"ep_pick_{p['id']}"
+        ))
+    bot.send_message(message.chat.id,
+                     f"✏️ *Edit Product*\n{DIV}\nTap the product you want to edit:",
+                     parse_mode="Markdown", reply_markup=m)
 
-def ep_id(message):
-    try:
-        pid = int(message.text.strip())
-    except (ValueError, TypeError):
-        bot.send_message(message.chat.id, "⚠️ Invalid ID. Send a number.")
-        return
-    s = admin_sessions.get(message.chat.id)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ep_pick_"))
+def ep_pick(call):
+    bot.answer_callback_query(call.id)
+    s = admin_sessions.get(call.message.chat.id)
     if not s:
-        bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /editproduct")
+        bot.send_message(call.message.chat.id, "⚠️ Session lost. Use /editproduct to restart.")
         return
+    pid = int(call.data.split("_")[-1])
     s["edit_id"] = pid
-    bot.send_message(
-        message.chat.id,
-        f"✏️ *Editing ID {pid}*\n{DIV}\n"
-        f"Send what to change:\n\n"
-        f"• `name: New Name`\n• `price: 350`\n"
-        f"• `category: Cakes`\n• `description: text`\n"
-        f"• `stock: 15`\n\n"
-        f"To update variants type:\n"
-        f"`variants: 500g:299, 1kg:499`\n\n"
-        f"Or send a *new photo* 📸",
-        parse_mode="Markdown"
+    product = get_product_by_id(pid)
+    pname = product["name"] if product else f"ID {pid}"
+    # Show what can be edited as inline buttons
+    em = InlineKeyboardMarkup(row_width=2)
+    em.add(
+        InlineKeyboardButton("📝 Name",        callback_data=f"epedit_name_{pid}"),
+        InlineKeyboardButton("💰 Price",       callback_data=f"epedit_price_{pid}"),
+        InlineKeyboardButton("📦 Stock",       callback_data=f"epedit_stock_{pid}"),
+        InlineKeyboardButton("🏷 Category",    callback_data=f"epedit_category_{pid}"),
+        InlineKeyboardButton("📄 Description", callback_data=f"epedit_description_{pid}"),
+        InlineKeyboardButton("📐 Variants",    callback_data=f"epedit_variants_{pid}"),
+        InlineKeyboardButton("📸 Photo",       callback_data=f"epedit_photo_{pid}"),
     )
-    bot.register_next_step_handler(message, ep_edit)
+    chat_id = call.message.chat.id if hasattr(call, "message") else call.chat.id
+    bot.send_message(chat_id,
+                     f"✏️ *Editing: {md(pname)}*\n{DIV}\nWhat do you want to change?",
+                     parse_mode="Markdown", reply_markup=em)
+
+# ── Edit field callbacks ─────────────────────────────
+
+EP_FIELD_PROMPTS = {
+    "name":        "📝 Send the new product name:",
+    "price":       "💰 Send the new price (just the number, e.g. 299):",
+    "stock":       "📦 Send the new stock quantity (99 = unlimited):",
+    "category":    "🏷 Send the new category (or type skip to clear it):",
+    "description": "📄 Send the new description (or type skip to clear it):",
+    "variants":    "📐 Type new variants:\n\n`500g:299, 1kg:499`\n\n_Format: label:price — comma separated_",
+    "photo":       "📸 Send the new product photo:",
+}
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("epedit_"))
+def epedit_field(call):
+    bot.answer_callback_query(call.id)
+    parts = call.data.split("_", 2)   # epedit_name_123
+    field = parts[1]
+    pid   = int(parts[2])
+    s = admin_sessions.get(call.message.chat.id)
+    if not s:
+        bot.send_message(call.message.chat.id, "⚠️ Session lost. Use /editproduct to restart.")
+        return
+    s["edit_id"]    = pid
+    s["edit_field"] = field
+    prompt = EP_FIELD_PROMPTS.get(field, "Send the new value:")
+    skip_fields = ("category","description")
+    kb = skip_kb() if field in skip_fields else None
+    bot.send_message(call.message.chat.id, prompt, parse_mode="Markdown",
+                     reply_markup=kb if kb else telebot.types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(call.message, ep_edit)
 
 def ep_edit(message):
     s = admin_sessions.get(message.chat.id)
     if not s:
-        bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /editproduct")
+        bot.send_message(message.chat.id, "⚠️ Session lost. Use /editproduct to restart.")
         return
 
-    if message.photo:
-        edit_product(s["shop"]["id"], s["edit_id"], photo=message.photo[-1].file_id)
-        bot.send_message(message.chat.id, "✅ *Photo updated!*\n\n/viewproducts",
-                         parse_mode="Markdown")
+    field    = s.get("edit_field")
+    pid      = s.get("edit_id")
+    shop_id  = s["shop"]["id"]
+
+    # Photo update
+    if message.photo and field == "photo":
+        edit_product(shop_id, pid, photo=message.photo[-1].file_id)
+        bot.send_message(message.chat.id, "✅ *Photo updated!*", parse_mode="Markdown",
+                         reply_markup=owner_reply_kb())
+        return
+    if message.photo and not field:
+        edit_product(shop_id, pid, photo=message.photo[-1].file_id)
+        bot.send_message(message.chat.id, "✅ *Photo updated!*", parse_mode="Markdown",
+                         reply_markup=owner_reply_kb())
         return
 
-    text = message.text or ""
-    if text.lower().startswith("variants:"):
-        raw      = text[9:].strip()
-        variants = []
-        order    = 0
+    raw = (message.text or "").strip()
+
+    if field == "variants":
+        variants, order = [], 0
         for part in raw.split(","):
             part = part.strip()
             if ":" in part:
                 try:
-                    label, price = part.split(":", 1)
-                    variants.append({
-                        "label":      label.strip(),
-                        "price":      float(re.sub(r'[^\d.]', '', price)),
-                        "sort_order": order
-                    })
-                    order += 1
+                    label, price_str = part.split(":", 1)
+                    pval = float(re.sub(r'[^\d.]', '', price_str))
+                    if label.strip() and pval > 0:
+                        variants.append({"label": label.strip(), "price": pval, "sort_order": order})
+                        order += 1
                 except Exception:
                     pass
-        if variants:
-            delete_variants(s["edit_id"])
-            for v in variants:
-                add_variant(s["edit_id"], s["shop"]["id"],
-                            v["label"], v["price"], sort_order=v["sort_order"])
+        if not variants:
             bot.send_message(message.chat.id,
-                             f"✅ *Variants updated!*\n\n/viewproducts",
+                             "⚠️ Couldn't read that.\nUse: `500g:299, 1kg:499`",
                              parse_mode="Markdown")
-        else:
-            bot.send_message(message.chat.id,
-                             "⚠️ Invalid format. Use: `500g:299, 1kg:499`",
-                             parse_mode="Markdown")
+            bot.register_next_step_handler(message, ep_edit)
+            return
+        delete_variants(pid)
+        for v in variants:
+            add_variant(pid, shop_id, v["label"], v["price"], sort_order=v["sort_order"])
+        bot.send_message(message.chat.id, f"✅ *Variants updated!* ({len(variants)} variants)",
+                         parse_mode="Markdown", reply_markup=owner_reply_kb())
         return
 
-    try:
-        field, value = text.split(":", 1)
-        field = field.strip().lower()
-        value = value.strip()
-        if field not in ["name","price","description","stock","category"]:
-            bot.send_message(message.chat.id,
-                             "⚠️ Invalid field. Use: name, price, category, description, stock")
-            return
-        if field == "price":
+    if not field:
+        bot.send_message(message.chat.id, "⚠️ Use /editproduct to start again.")
+        return
+
+    value = raw
+    skip_val = value.lower() in ("skip","⏭ skip")
+    if field == "price":
+        try:
             value = float(re.sub(r'[^\d.]', '', value))
-        elif field == "stock":
+            if value <= 0: raise ValueError
+        except (ValueError, TypeError):
+            bot.send_message(message.chat.id, "⚠️ Invalid price. Send a number like 299:")
+            bot.register_next_step_handler(message, ep_edit)
+            return
+    elif field == "stock":
+        try:
             value = int(re.sub(r'[^\d]', '', value))
-        edit_product(s["shop"]["id"], s["edit_id"], **{field: value})
-        bot.send_message(message.chat.id,
-                         f"✅ *{field.title()}* updated.\n\n/viewproducts",
-                         parse_mode="Markdown")
-    except Exception:
-        bot.send_message(message.chat.id,
-                         "⚠️ Format: `field: value`\nExample: `price: 350`",
-                         parse_mode="Markdown")
+        except (ValueError, TypeError):
+            bot.send_message(message.chat.id, "⚠️ Invalid stock. Send a number like 10:")
+            bot.register_next_step_handler(message, ep_edit)
+            return
+    elif skip_val:
+        value = ""
+
+    edit_product(shop_id, pid, **{field: value})
+    bot.send_message(message.chat.id,
+                     f"✅ *{field.title()} updated!*",
+                     parse_mode="Markdown", reply_markup=owner_reply_kb())
 
 
 @bot.message_handler(commands=['deleteproduct'])
@@ -2263,36 +2402,37 @@ def delete_product_start(message):
     if not products:
         bot.send_message(message.chat.id, "No products to delete.")
         return
-    text = f"🗑 *Delete Product*\n{DIV}\nSend the ID:\n\n"
-    for p in products:
-        text += f"*ID {p['id']}* — {p['name']}\n"
     admin_sessions[message.chat.id] = {"shop": shop}
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
-    bot.register_next_step_handler(message, dp_confirm)
+    m = InlineKeyboardMarkup(row_width=1)
+    for p in products:
+        m.add(InlineKeyboardButton(
+            f"🗑 {p['name']} — ₹{fmt(p['price'])}",
+            callback_data=f"dp_pick_{p['id']}"
+        ))
+    bot.send_message(message.chat.id,
+                     f"🗑 *Delete Product*\n{DIV}\nTap the product to delete:",
+                     parse_mode="Markdown", reply_markup=m)
 
-def dp_confirm(message):
-    try:
-        pid = int(message.text.strip())
-    except (ValueError, TypeError):
-        bot.send_message(message.chat.id, "⚠️ Invalid ID.")
-        return
-    s = admin_sessions.get(message.chat.id)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dp_pick_"))
+def dp_pick(call):
+    bot.answer_callback_query(call.id)
+    s = admin_sessions.get(call.message.chat.id)
     if not s:
-        bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /deleteproduct")
+        bot.send_message(call.message.chat.id, "⚠️ Session lost. Use /deleteproduct to restart.")
         return
-    # Show product name + confirmation button
+    pid     = int(call.data.split("_")[-1])
     product = get_product_by_id(pid)
     if not product or product.get("client_id") != s["shop"]["id"]:
-        bot.send_message(message.chat.id, "❌ Product not found.")
+        bot.answer_callback_query(call.id, "Product not found.")
         return
     s["delete_id"] = pid
     m = InlineKeyboardMarkup()
     m.add(
-        InlineKeyboardButton(f"⚠️ Yes, Delete '{product['name']}'", callback_data=f"dp_yes_{pid}"),
+        InlineKeyboardButton(f"⚠️ Yes, delete '{product['name']}'", callback_data=f"dp_yes_{pid}"),
         InlineKeyboardButton("❌ Cancel", callback_data="dp_no")
     )
-    bot.send_message(message.chat.id,
-                     f"⚠️ *Are you sure?*\n\nDelete *{product['name']}* (ID {pid})?\n\nThis cannot be undone.",
+    bot.send_message(call.message.chat.id,
+                     f"⚠️ *Delete {md(product['name'])}?*\n\nThis cannot be undone.",
                      parse_mode="Markdown", reply_markup=m)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dp_yes_"))
@@ -2309,9 +2449,7 @@ def dp_yes(call):
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
     except Exception:
         pass
-    m = InlineKeyboardMarkup()
-    m.add(InlineKeyboardButton("📦 View Products", callback_data="owner_viewproducts"))
-    bot.send_message(call.message.chat.id, f"✅ Product deleted.", reply_markup=m)
+    bot.send_message(call.message.chat.id, "✅ Product deleted.", reply_markup=owner_reply_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data == "dp_no")
 def dp_no(call):
@@ -2411,15 +2549,50 @@ def help_cmd(message):
     )
     bot.send_message(
         message.chat.id,
-        f"🛍 *TeleKart — Owner Commands*\n{DIV}\n"
-        f"📦 /orders · /stats · /delivered TK-001\n"
-        f"📣 /broadcast\n"
-        f"🏷 /viewproducts · /addproduct · /editproduct · /deleteproduct\n"
-        f"🖼 /setlogo\n"
-        f"{DIV}\n_Tap a button below to get started quickly:_",
-        parse_mode="Markdown", reply_markup=hm
+        f"🛍 *TeleKart — Owner Panel*\n{DIV}\n"
+        f"Use the buttons below or type commands:\n\n"
+        f"📦 /orders — view & action orders\n"
+        f"📊 /stats — revenue dashboard\n"
+        f"➕ /addproduct — add new product\n"
+        f"✏️ /editproduct — edit existing product\n"
+        f"🗑 /deleteproduct — remove product\n"
+        f"🏷 /viewproducts — see all products\n"
+        f"📣 /broadcast — message all customers\n"
+        f"🖼 /setlogo — set shop photo\n"
+        f"{DIV}",
+        parse_mode="Markdown", reply_markup=owner_reply_kb()
     )
 
+
+# ═══════════════════════════════════════════════════════
+# OWNER REPLY KEYBOARD — handle bottom button taps
+# ═══════════════════════════════════════════════════════
+
+OWNER_KB_MAP = {
+    "📦 Orders":       lambda m: orders_cmd(m),
+    "➕ Add Product":  lambda m: add_product_start(m),
+    "✏️ Edit Product": lambda m: edit_product_start(m),
+    "📊 Stats":        lambda m: stats(m),
+    "📣 Broadcast":    lambda m: broadcast_start(m),
+    "🏷 Products":     lambda m: view_products(m),
+    "🔗 Shop Link":    lambda m: _send_shop_link(m),
+    "🖼 Set Logo":     lambda m: set_logo_start(m),
+    "❓ Help":         lambda m: help_cmd(m),
+}
+
+def _send_shop_link(message):
+    shop = get_client_by_owner(message.chat.id)
+    if not shop:
+        bot.send_message(message.chat.id, "❌ No shop found.")
+        return
+    link = f"https://t.me/{BOT_USERNAME}?start={shop['slug']}"
+    bot.send_message(message.chat.id,
+                     f"🔗 *Your Shop Link:*\n`{link}`\n\nShare with your customers!",
+                     parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text in OWNER_KB_MAP and get_client_by_owner(msg.chat.id) is not None)
+def handle_owner_kb(message):
+    OWNER_KB_MAP[message.text](message)
 
 # ═══════════════════════════════════════════════════════
 # CATCH-ALL
@@ -2432,6 +2605,13 @@ def unknown_message(message):
         handle_pasted_link(message)
         return
 
+    # Check if owner — show owner kb
+    shop = get_client_by_owner(message.chat.id)
+    if shop:
+        bot.send_message(message.chat.id,
+                         "👇 Use the buttons below:",
+                         reply_markup=owner_reply_kb())
+        return
     s = load_session(message.chat.id)
     if s:
         bot.send_message(message.chat.id,
