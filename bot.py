@@ -35,21 +35,44 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, num_threads=4)
 
-# Set bot command menu — shows in Menu button for all users
-from telebot.types import BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telebot.types import BotCommand, BotCommandScopeChat, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+
+# ── Command lists ─────────────────────────────────────
+BUYER_COMMANDS = [
+    BotCommand("start",  "🛍 Open shop"),
+    BotCommand("cancel", "❌ Cancel checkout"),
+]
+
+OWNER_COMMANDS = [
+    BotCommand("orders",       "📦 View orders"),
+    BotCommand("stats",        "📊 Dashboard"),
+    BotCommand("addproduct",   "➕ Add product"),
+    BotCommand("editproduct",  "✏️ Edit product"),
+    BotCommand("deleteproduct","🗑 Delete product"),
+    BotCommand("viewproducts", "🏷 View products"),
+    BotCommand("broadcast",    "📣 Broadcast"),
+    BotCommand("setlogo",      "🖼 Set shop logo"),
+    BotCommand("help",         "❓ Help"),
+    BotCommand("cancel",       "❌ Cancel"),
+]
+
+# Default global commands = buyer-only (safe fallback for anyone not yet scoped)
 try:
-    bot.set_my_commands([
-        BotCommand("start",        "🛍 Open shop"),
-        BotCommand("orders",       "📦 View orders"),
-        BotCommand("cancel",       "❌ Cancel checkout"),
-        BotCommand("help",         "⚙️ Owner commands"),
-        BotCommand("addproduct",   "➕ Add product"),
-        BotCommand("editproduct",  "✏️ Edit product"),
-        BotCommand("stats",        "📊 Stats"),
-        BotCommand("broadcast",    "📣 Broadcast"),
-    ])
+    bot.set_my_commands(BUYER_COMMANDS)
 except Exception:
     pass
+
+def set_commands_for_user(chat_id, is_owner=False):
+    """Set scoped commands so owners see owner menu, buyers see buyer menu only."""
+    try:
+        cmds = OWNER_COMMANDS if is_owner else BUYER_COMMANDS
+        bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id))
+    except Exception as e:
+        print(f"set_commands_for_user failed for {chat_id}: {e}")
+
+def _is_owner(chat_id):
+    """Security helper — single source of truth for owner check."""
+    return get_client_by_owner(chat_id) is not None
 
 def skip_kb():
     """Simple keyboard with just a Skip button for optional fields."""
@@ -58,7 +81,7 @@ def skip_kb():
     return m
 
 def owner_reply_kb():
-    """Persistent bottom keyboard for owners."""
+    """Persistent bottom keyboard for owners — 9 key actions, no buyer stuff."""
     m = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     m.add(
         KeyboardButton("📦 Orders"),
@@ -77,7 +100,28 @@ def owner_reply_kb():
     )
     return m
 
+def buyer_reply_kb(lang="english"):
+    """Persistent bottom keyboard for buyers — shown like the idbot example.
+    Labels are translated so all languages get their native button text."""
+    m = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(
+        KeyboardButton(t(lang, "browse")),
+        KeyboardButton(t(lang, "cart")),
+    )
+    m.add(
+        KeyboardButton(t(lang, "my_orders")),
+        KeyboardButton(t(lang, "about")),
+    )
+    m.add(
+        KeyboardButton(t(lang, "change_language")),
+    )
+    return m
+
 DIV = "━━━━━━━━━━━━━━━"
+
+def _is_skip(text):
+    """Case-insensitive skip detection for optional fields."""
+    return (text or "").strip().lower() in ("skip", "⏭ skip", "⏭skip", "s")
 
 # ── Checkout states ──
 STATE_IDLE     = "idle"
@@ -238,23 +282,36 @@ def build_welcome_text(shop):
         f"What would you like today?"
     )
 
-def send_welcome(chat_id, shop, reply_markup=None):
-    """Send welcome — with shop logo/banner if available, else plain text."""
+def send_welcome(chat_id, shop, reply_markup=None, remove_reply_kb=False):
+    """Send welcome with buyer persistent keyboard.
+    No photo: buyer kb + inline buttons on same message.
+    With photo: buyer kb on photo, inline on a follow-up (Telegram limitation)."""
     text = build_welcome_text(shop)
+    lang = get_lang(chat_id)
+    buyer_kb = buyer_reply_kb(lang)
+
+    if remove_reply_kb:
+        try:
+            msg = bot.send_message(chat_id, "🛍", reply_markup=ReplyKeyboardRemove())
+            bot.delete_message(chat_id, msg.message_id)
+        except Exception:
+            pass
+
     photo = shop.get("shop_photo", "")
     if photo:
         try:
-            bot.send_photo(
-                chat_id, photo,
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
+            bot.send_photo(chat_id, photo, caption=text,
+                           parse_mode="Markdown", reply_markup=buyer_kb)
+            if reply_markup:
+                bot.send_message(chat_id, "👇 Tap to browse:", reply_markup=reply_markup)
             return
         except Exception as e:
             print(f"Failed to send shop photo: {e}")
-    # Fallback — plain text welcome
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    # No photo — send welcome with persistent buyer kb
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=buyer_kb)
+    if reply_markup:
+        bot.send_message(chat_id, "👇", reply_markup=reply_markup)
 
 def parse_slug_from_input(text):
     """
@@ -392,6 +449,7 @@ def start(message):
         # Check if this is a registered owner
         owner_shop = get_client_by_owner(message.chat.id)
         if owner_shop:
+            set_commands_for_user(message.chat.id, is_owner=True)
             shop_link = f"https://t.me/{BOT_USERNAME}?start={owner_shop['slug']}"
             bot.send_message(
                 message.chat.id,
@@ -450,6 +508,9 @@ def start(message):
         delivery_date=""
     )
 
+    # Set scoped menu commands — buyer sees browse/cancel, never owner commands
+    set_commands_for_user(message.chat.id, is_owner=False)
+
     # First-time visitor — show language picker before welcome
     # Session row is guaranteed to exist now (upsert above), so set_language can safely update it
     is_first_visit = not existing or not existing.get("language")
@@ -472,7 +533,8 @@ def start(message):
             t(lang, "welcome_back_cart", n=n, word=items_word),
             parse_mode="Markdown"
         )
-    send_welcome(message.chat.id, shop, reply_markup=home_kb(message.chat.id))
+    send_welcome(message.chat.id, shop, reply_markup=home_kb(message.chat.id),
+                 remove_reply_kb=True)
 
 
 # ── Handle pasted shop links in chat ────────────────
@@ -505,16 +567,14 @@ def go_home(call):
         bot.send_message(call.message.chat.id,
                          "⚠️ Session expired. Please open your shop link again.")
         return
-    # If shop has a logo, can't edit (photo vs text mismatch), send fresh
-    if shop.get("shop_photo"):
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-        send_welcome(call.message.chat.id, shop, reply_markup=home_kb(call.message.chat.id))
-    else:
-        try_edit(call.message.chat.id, call.message.message_id,
-                 build_welcome_text(shop), parse_mode="Markdown", reply_markup=home_kb(call.message.chat.id))
+    lang = get_lang(call.message.chat.id)
+    # Always send fresh welcome with buyer keyboard (can't edit photo messages, and
+    # we need to ensure the persistent keyboard is always visible)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    send_welcome(call.message.chat.id, shop, reply_markup=home_kb(call.message.chat.id))
 
 
 # ═══════════════════════════════════════════════════════
@@ -546,8 +606,11 @@ def set_language(call):
     except Exception:
         pass
 
-    send_welcome(call.message.chat.id, shop, reply_markup=home_kb(call.message.chat.id))
-
+    # Send welcome — pass lang explicitly so buyer_reply_kb uses the NEW language immediately
+    text = build_welcome_text(shop)
+    buyer_kb = buyer_reply_kb(lang)   # use new lang directly, not get_lang() which may be cached
+    bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=buyer_kb)
+    bot.send_message(call.message.chat.id, "👇", reply_markup=home_kb(call.message.chat.id))
 
 @bot.callback_query_handler(func=lambda c: c.data == "change_language")
 def change_language(call):
@@ -904,13 +967,14 @@ def remove_item(call):
     removed_name = None
     for i, item in enumerate(cart):
         if item["product_id"] == product_id and item.get("variant_id") == variant_id:
+            # Read name BEFORE potentially popping the item
+            removed_name = item["name"]
+            if item.get("variant_label"):
+                removed_name += f" ({item['variant_label']})"
             if item.get("quantity", 1) > 1:
                 item["quantity"] -= 1
             else:
                 cart.pop(i)
-            removed_name = item["name"]
-            if item.get("variant_label"):
-                removed_name += f" ({item['variant_label']})"
             break
 
     set_cart(call.message.chat.id, cart)
@@ -1316,7 +1380,7 @@ def _place_order(call, payment_method="upi"):
         f"🏪 {shop['name']}\n"
         f"📦 {md(items_text)}\n"
         f"💰 Subtotal: ₹{fmt(subtotal)}\n"
-        f"🚚 Delivery: ₹{int(dc)}\n"
+        + (f"🚚 Delivery: ₹{int(dc)}\n" if dc else "🚚 Free Delivery\n") +
         f"💳 *Total: ₹{fmt(total)}*\n"
         f"📍 {md(address)}\n🗓 {md(date)}\n"
         f"{DIV}"
@@ -1347,8 +1411,8 @@ def _place_order(call, payment_method="upi"):
     elif payment_method == "cod":
         bot.send_message(call.message.chat.id, pay_section, parse_mode="Markdown")
 
-    # Mark payment status based on method
-    update_payment_status(order["id"], "paid" if payment_method == "upi" else "pending")
+    # Mark payment status — UPI stays "pending" until owner confirms; COD is always pending
+    update_payment_status(order["id"], "pending")
 
     # Clear cart
     set_cart(call.message.chat.id, [])
@@ -1730,20 +1794,29 @@ def handle_review(call):
 # ═══════════════════════════════════════════════════════
 
 # ── Owner shortcut callbacks (from inline buttons) ──────
+# Security: every callback verifies the caller is a registered owner before proceeding.
+
+def _owner_only(call):
+    """Returns the shop if caller is an owner, else answers the callback with an error and returns None."""
+    shop = get_client_by_owner(call.message.chat.id)
+    if not shop:
+        bot.answer_callback_query(call.id, "⛔ Owner access only.", show_alert=True)
+    return shop
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_stats")
 def owner_stats_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/stats"
     stats(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_shoplink")
 def owner_shoplink_cb(call):
-    bot.answer_callback_query(call.id)
-    shop = get_client_by_owner(call.message.chat.id)
+    shop = _owner_only(call)
     if not shop:
-        bot.send_message(call.message.chat.id, "❌ No shop found.")
         return
+    bot.answer_callback_query(call.id)
     link = f"https://t.me/{BOT_USERNAME}?start={shop['slug']}"
     bot.send_message(call.message.chat.id,
                      f"🔗 *Your Shop Link:*\n`{link}`\n\nShare this with your customers!",
@@ -1751,36 +1824,48 @@ def owner_shoplink_cb(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_orders")
 def owner_orders_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/orders"
     orders_cmd(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_broadcast")
 def owner_broadcast_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/broadcast"
     broadcast_start(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_viewproducts")
 def owner_viewproducts_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/viewproducts"
     view_products(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_addproduct")
 def owner_addproduct_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/addproduct"
     add_product_start(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_editproduct")
 def owner_editproduct_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/editproduct"
     edit_product_start(call.message)
 
 @bot.callback_query_handler(func=lambda c: c.data == "owner_deleteproduct")
 def owner_deleteproduct_cb(call):
+    if not _owner_only(call):
+        return
     bot.answer_callback_query(call.id)
     call.message.text = "/deleteproduct"
     delete_product_start(call.message)
@@ -1792,6 +1877,7 @@ def stats(message):
     if not shop:
         bot.send_message(message.chat.id, "❌ You don't have a shop registered.")
         return
+    set_commands_for_user(message.chat.id, is_owner=True)
     data          = get_client_stats(shop["id"])
     rating, rcount = get_shop_rating(shop["id"])
     sm = InlineKeyboardMarkup(row_width=2)
@@ -2081,7 +2167,7 @@ def ap_category(message):
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
     raw_cat = (message.text or "").strip()
-    s["new_product"]["category"] = "" if raw_cat.lower() in ("skip","⏭ skip") else raw_cat
+    s["new_product"]["category"] = "" if _is_skip(raw_cat) else raw_cat
     bot.send_message(message.chat.id,
                      "*Step 4 of 7* — Description?\n_Short description — or tap Skip_",
                      parse_mode="Markdown", reply_markup=skip_kb())
@@ -2093,7 +2179,7 @@ def ap_description(message):
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
     raw_desc = (message.text or "").strip()
-    s["new_product"]["description"] = "" if raw_desc.lower() in ("skip","⏭ skip") else raw_desc
+    s["new_product"]["description"] = "" if _is_skip(raw_desc) else raw_desc
     bot.send_message(message.chat.id,
                      "*Step 5 of 7* — Stock quantity?\n_How many do you have? Type 99 for unlimited._",
                      parse_mode="Markdown")
@@ -2130,7 +2216,7 @@ def ap_variants(message):
         bot.send_message(message.chat.id, "⚠️ Session lost. Please start again with /addproduct")
         return
     raw = (message.text or "").strip()
-    if raw.lower() in ("skip", "⏭ skip"):
+    if _is_skip(raw):
         s["new_product"]["variants"] = []
     else:
         variants = []
@@ -2177,7 +2263,7 @@ def ap_photo(message):
         return
     if message.photo:
         photo_id = message.photo[-1].file_id
-    elif message.text and message.text.lower().replace("⏭ ","") == "skip":
+    elif message.text and _is_skip(message.text):
         photo_id = ""
     else:
         bot.send_message(message.chat.id,
@@ -2367,7 +2453,7 @@ def ep_edit(message):
         return
 
     value = raw
-    skip_val = value.lower() in ("skip","⏭ skip")
+    skip_val = _is_skip(value)
     if field == "price":
         try:
             value = float(re.sub(r'[^\d.]', '', value))
@@ -2520,48 +2606,79 @@ def cancel_cmd(message):
         return
     update_session(message.chat.id, state=STATE_IDLE)
     shop = get_shop_for_session(message.chat.id)
-    shop_name = shop["name"] if shop else "the shop"
     m = InlineKeyboardMarkup()
-    m.add(InlineKeyboardButton("🛒 Back to Cart", callback_data="cart"))
-    m.add(InlineKeyboardButton("🏠 Menu",         callback_data="home"))
+    if shop:
+        # Only show cart/menu buttons if session has a valid shop
+        m.add(InlineKeyboardButton("🛒 Back to Cart", callback_data="cart"))
+        m.add(InlineKeyboardButton("🏠 Menu",         callback_data="home"))
     bot.send_message(
         message.chat.id,
         t(get_lang(message.chat.id), "checkout_cancelled"),
-
-        reply_markup=m
+        reply_markup=m if shop else None
     )
 
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
-    hm = InlineKeyboardMarkup(row_width=2)
-    hm.add(
-        InlineKeyboardButton("📊 Stats",       callback_data="owner_stats"),
-        InlineKeyboardButton("📦 Orders",      callback_data="owner_orders")
-    )
-    hm.add(
-        InlineKeyboardButton("🏷 Products",    callback_data="owner_viewproducts"),
-        InlineKeyboardButton("📣 Broadcast",   callback_data="owner_broadcast")
-    )
-    hm.add(
-        InlineKeyboardButton("➕ Add Product", callback_data="owner_addproduct"),
-        InlineKeyboardButton("🔗 Shop Link",   callback_data="owner_shoplink")
-    )
-    bot.send_message(
-        message.chat.id,
-        f"🛍 *TeleKart — Owner Panel*\n{DIV}\n"
-        f"Use the buttons below or type commands:\n\n"
-        f"📦 /orders — view & action orders\n"
-        f"📊 /stats — revenue dashboard\n"
-        f"➕ /addproduct — add new product\n"
-        f"✏️ /editproduct — edit existing product\n"
-        f"🗑 /deleteproduct — remove product\n"
-        f"🏷 /viewproducts — see all products\n"
-        f"📣 /broadcast — message all customers\n"
-        f"🖼 /setlogo — set shop photo\n"
-        f"{DIV}",
-        parse_mode="Markdown", reply_markup=owner_reply_kb()
-    )
+    shop = get_client_by_owner(message.chat.id)
+    if shop:
+        # ── Owner help ──
+        set_commands_for_user(message.chat.id, is_owner=True)
+        hm = InlineKeyboardMarkup(row_width=2)
+        hm.add(
+            InlineKeyboardButton("📊 Stats",       callback_data="owner_stats"),
+            InlineKeyboardButton("📦 Orders",      callback_data="owner_orders")
+        )
+        hm.add(
+            InlineKeyboardButton("🏷 Products",    callback_data="owner_viewproducts"),
+            InlineKeyboardButton("📣 Broadcast",   callback_data="owner_broadcast")
+        )
+        hm.add(
+            InlineKeyboardButton("➕ Add Product", callback_data="owner_addproduct"),
+            InlineKeyboardButton("🔗 Shop Link",   callback_data="owner_shoplink")
+        )
+        bot.send_message(
+            message.chat.id,
+            f"🛍 *TeleKart — Owner Panel*\n{DIV}\n"
+            f"Use the buttons below or type commands:\n\n"
+            f"📦 /orders — view & action orders\n"
+            f"📊 /stats — revenue dashboard\n"
+            f"➕ /addproduct — add new product\n"
+            f"✏️ /editproduct — edit existing product\n"
+            f"🗑 /deleteproduct — remove product\n"
+            f"🏷 /viewproducts — see all products\n"
+            f"📣 /broadcast — message all customers\n"
+            f"🖼 /setlogo — set shop photo\n"
+            f"{DIV}",
+            parse_mode="Markdown", reply_markup=owner_reply_kb()
+        )
+    else:
+        # ── Buyer help — no owner features shown ──
+        set_commands_for_user(message.chat.id, is_owner=False)
+        s = load_session(message.chat.id)
+        bm = InlineKeyboardMarkup(row_width=2)
+        if s:
+            bm.add(
+                InlineKeyboardButton("🛍 Browse Products", callback_data="browse"),
+                InlineKeyboardButton("🛒 My Cart",         callback_data="cart")
+            )
+            bm.add(
+                InlineKeyboardButton("📦 My Orders",       callback_data="my_orders"),
+                InlineKeyboardButton("🏠 Menu",            callback_data="home")
+            )
+        bot.send_message(
+            message.chat.id,
+            f"❓ *Help*\n{DIV}\n"
+            f"Open your shop link to start shopping.\n\n"
+            f"• Browse products & add to cart\n"
+            f"• Checkout with address & phone\n"
+            f"• Track your orders\n"
+            f"• Rate delivered items\n\n"
+            f"_If you're a shop owner, contact support to register your shop._\n"
+            f"{DIV}",
+            parse_mode="Markdown",
+            reply_markup=bm if s else None
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -2590,9 +2707,176 @@ def _send_shop_link(message):
                      f"🔗 *Your Shop Link:*\n`{link}`\n\nShare with your customers!",
                      parse_mode="Markdown")
 
-@bot.message_handler(func=lambda msg: msg.text in OWNER_KB_MAP and get_client_by_owner(msg.chat.id) is not None)
+@bot.message_handler(func=lambda msg: msg.text in OWNER_KB_MAP)
 def handle_owner_kb(message):
+    # Security: verify this user is actually a registered owner before executing anything
+    if not get_client_by_owner(message.chat.id):
+        # Force-reset their commands to buyer scope and dismiss the stale keyboard
+        set_commands_for_user(message.chat.id, is_owner=False)
+        s = load_session(message.chat.id)
+        if s:
+            shop = get_shop_for_session(message.chat.id)
+            if shop:
+                send_welcome(message.chat.id, shop, reply_markup=home_kb(message.chat.id))
+                return
+        bot.send_message(message.chat.id,
+                         "😊 Use your shop link to get started.",
+                         reply_markup=ReplyKeyboardRemove())
+        return
     OWNER_KB_MAP[message.text](message)
+
+
+# ═══════════════════════════════════════════════════════
+# BUYER REPLY KEYBOARD — handle bottom button taps
+# Matches translated labels from buyer_reply_kb() for all languages
+# ═══════════════════════════════════════════════════════
+
+def _get_buyer_action(text, chat_id):
+    """Map a buyer keyboard button text (any language) to its callback action."""
+    lang = get_lang(chat_id)
+    mapping = {
+        t(lang, "browse"):          "browse",
+        t(lang, "cart"):            "cart",
+        t(lang, "my_orders"):       "my_orders",
+        t(lang, "about"):           "about",
+        t(lang, "change_language"): "change_language",
+    }
+    return mapping.get(text)
+
+# Pre-built set of ALL possible buyer keyboard labels across all languages.
+# Used as a fast first-pass filter so we only hit the DB when text could be a buyer button.
+_ALL_BUYER_LABELS = {
+    "🛍 Browse Products", "🛍 प्रोडक्ट देखें", "🛍 పొడక్ట్స్ చూడండి",
+    "🛍 ప్రొడక్ట్స్ చూడండి", "🛍 ಉತ್ಪನ್ನಗಳನ್ನು ನೋಡಿ", "🛍 பொருட்களை பார்க்க",
+    "🛍 ഉൽപ്പന്നങ്ങൾ കാണുക",
+    "🛒 My Cart", "🛒 मेरी कार्ट", "🛒 నా కార్ట్", "🛒 ನನ್ನ ಕಾರ್ಟ್",
+    "🛒 என் கார்ட்", "🛒 എന്റെ കാർട്ട്",
+    "📦 My Orders", "📦 मेरे ऑर्डर", "📦 నా ఆర్డర్లు", "📦 ನನ್ನ ಆರ್ಡರ್\u200cಗಳು",
+    "📦 என் ஆர்டர்கள்", "📦 എന്റെ ഓർഡറുകൾ",
+    "ℹ️ About", "ℹ️ शॉप के बारे में", "ℹ️ షాప్ గురించి", "ℹ️ ಅಂಗಡಿ ಬಗ್ಗೆ",
+    "ℹ️ கடை பற்றி", "ℹ️ കടയെക്കുറിച്ച്",
+    "🌐 Language", "🌐 भाषा", "🌐 భాష", "🌐 ಭಾಷೆ", "🌐 மொழி", "🌐 ഭാഷ",
+}
+
+@bot.message_handler(func=lambda msg: (
+    msg.text is not None and
+    msg.text in _ALL_BUYER_LABELS and
+    get_state(msg.chat.id) == STATE_IDLE and
+    _get_buyer_action(msg.text, msg.chat.id) is not None
+))
+def handle_buyer_kb(message):
+    """Handle buyer bottom keyboard button taps — works in every language."""
+    # Security: if owner taps a button that matches a buyer label, ignore — owner kb handler covers them
+    if get_client_by_owner(message.chat.id):
+        return
+    s = load_session(message.chat.id)
+    if not s:
+        bot.send_message(message.chat.id,
+                         "👋 Please open your shop link to start shopping.")
+        return
+    action = _get_buyer_action(message.text, message.chat.id)
+    lang = get_lang(message.chat.id)
+    shop = get_shop_for_session(message.chat.id)
+
+    if action == "browse":
+        if not shop:
+            bot.send_message(message.chat.id, "⚠️ Session expired. Open your shop link again.")
+            return
+        cats = get_categories(shop["id"])
+        if cats:
+            m = InlineKeyboardMarkup(row_width=2)
+            for cat in cats:
+                prods = get_products(shop["id"], category=cat)
+                avail = sum(1 for p in prods if p.get("stock", 99) > 0)
+                if avail == 0:
+                    continue
+                m.add(InlineKeyboardButton(f"{cat}  ({avail} items)",
+                                           callback_data=f"cat_{cat}"))
+            m.add(InlineKeyboardButton("🏠 Menu", callback_data="home"))
+            bot.send_message(message.chat.id,
+                             f"🛍 *{shop['name']}*\n{DIV}\nChoose a category 👇",
+                             parse_mode="Markdown", reply_markup=m)
+        else:
+            products = get_products(shop["id"])
+            if not products:
+                bot.send_message(message.chat.id, t(lang, "no_products"))
+                return
+            _send_product_list(message.chat.id, products, shop["name"])
+
+    elif action == "cart":
+        cart = get_cart(message.chat.id)
+        if not cart:
+            m = InlineKeyboardMarkup()
+            m.add(InlineKeyboardButton("🛍 Browse Products", callback_data="browse"))
+            bot.send_message(message.chat.id,
+                             t(lang, "empty_cart"),
+                             parse_mode="Markdown", reply_markup=m)
+        else:
+            dc = shop.get("delivery_charge", 0) if shop else 0
+            lines, subtotal, total = build_cart_display(cart, dc)
+            text = f"🛒 *Your Cart*\n{DIV}\n{lines}{DIV}\n💰 Subtotal: ₹{fmt(subtotal)}\n"
+            if dc:
+                text += f"🚚 Delivery: ₹{int(dc)}\n"
+            text += f"💳 *Total: ₹{fmt(total)}*"
+            bot.send_message(message.chat.id, text,
+                             parse_mode="Markdown", reply_markup=cart_keyboard(cart))
+
+    elif action == "my_orders":
+        if not s:
+            bot.send_message(message.chat.id, "Please open the shop link first.")
+            return
+        orders = get_orders_by_customer(message.chat.id, s["shop_id"])
+        if not orders:
+            m = InlineKeyboardMarkup()
+            m.add(InlineKeyboardButton("🛍 Start Shopping", callback_data="browse"))
+            bot.send_message(message.chat.id,
+                             t(lang, "no_orders"),
+                             parse_mode="Markdown", reply_markup=m)
+            return
+        icons = {"pending": "⏳", "confirmed": "✅", "delivered": "🎉", "cancelled": "❌"}
+        text = t(lang, "my_orders_header") + f"\n{DIV}\n"
+        m = InlineKeyboardMarkup()
+        for o in orders[:10]:
+            items_str = ", ".join([
+                f"{i['name']}{' (' + i['variant_label'] + ')' if i.get('variant_label') else ''}"
+                for i in o.get("items", [])
+            ]) or "—"
+            ref = o.get("order_ref", o["id"][:6])
+            icon = icons.get(o["status"], "•")
+            text += f"{icon} *{ref}*\n   {items_str}\n   ₹{fmt(o['total'])} • {o['status'].title()}\n\n"
+            if o["status"] == "pending":
+                m.add(InlineKeyboardButton(f"❌ Cancel {ref}",
+                                           callback_data=f"customer_cancel|{o['id']}"))
+            if o["status"] == "delivered":
+                m.add(InlineKeyboardButton(f"🔄 Reorder {ref}",
+                                           callback_data=f"reorder_{o['id']}"))
+        m.add(InlineKeyboardButton("🏠 Back to Menu", callback_data="home"))
+        bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=m)
+
+    elif action == "about":
+        if not shop:
+            bot.send_message(message.chat.id, "Please open the shop link first.")
+            return
+        rating, rcount = get_shop_rating(shop["id"])
+        dc = shop.get("delivery_charge", 0)
+        text = f"🏪 *{shop['name']}*\n{DIV}\n"
+        text += f"⭐ {rating}/5  ({rcount} reviews)\n" if rating else "⭐ No reviews yet\n"
+        if shop.get("tagline"):   text += f"💬 {shop['tagline']}\n"
+        if shop.get("shop_hours"): text += f"🕐 {shop['shop_hours']}\n"
+        if shop.get("delivery_areas"): text += f"📍 Delivers to: {shop['delivery_areas']}\n"
+        text += f"🚚 Delivery: {'Free' if not dc else f'₹{int(dc)}'}\n"
+        if shop.get("contact"):   text += f"📞 {shop['contact']}\n"
+        text += DIV
+        m = InlineKeyboardMarkup()
+        m.add(InlineKeyboardButton("🛍 Browse Products", callback_data="browse"))
+        bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=m)
+
+    elif action == "change_language":
+        bot.send_message(message.chat.id,
+                         t(lang, "choose_language"),
+                         parse_mode="Markdown",
+                         reply_markup=language_picker_keyboard())
+
 
 # ═══════════════════════════════════════════════════════
 # CATCH-ALL
@@ -2612,11 +2896,19 @@ def unknown_message(message):
                          "👇 Use the buttons below:",
                          reply_markup=owner_reply_kb())
         return
+
     s = load_session(message.chat.id)
+    lang = get_lang(message.chat.id)
     if s:
-        bot.send_message(message.chat.id,
-                         "😊 Use the buttons below:",
+        shop = get_shop_for_session(message.chat.id)
+        if shop:
+            # Re-show the welcome screen with full keyboard
+            send_welcome(message.chat.id, shop,
                          reply_markup=home_kb(message.chat.id))
+        else:
+            bot.send_message(message.chat.id,
+                             "⚠️ Session expired. Please open your shop link again.",
+                             reply_markup=ReplyKeyboardRemove())
     else:
         bot.send_message(message.chat.id,
                          "👋 Use your shop link to get started,\nor type /help if you're a shop owner.")
